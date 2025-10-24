@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: zuvic-tickets-service
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    envVars:
+      - key: PROXY_SECRET
+        sync: false  # add value in Render dashboard
