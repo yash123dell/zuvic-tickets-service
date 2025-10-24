@@ -1,41 +1,57 @@
-import crypto from "crypto";
-import express from "express";
+import crypto from 'crypto';
+import express from 'express';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const PROXY_SECRET = process.env.PROXY_SECRET || "";
 
-// Simple HMAC check for Shopify App Proxy requests
-function verifyHmac(query) {
+// Use your app's "API secret key" (from Shopify → App → API credentials)
+const PROXY_SECRET = process.env.PROXY_SECRET || '';
+
+// ---- Health check for Render ----
+app.get('/healthz', (_req, res) => res.status(200).send('ok'));
+
+// ---- Optional: verify Shopify App Proxy signature ----
+function verifySignature(query) {
   if (!PROXY_SECRET) return false;
-  const { signature, ...rest } = query;               // Shopify sends signature
-  const message = Object.keys(rest)
+  const { signature, ...rest } = query;
+  if (!signature) return false;
+
+  const msg = Object.keys(rest)
     .sort()
     .map(k => `${k}=${rest[k]}`)
-    .join('');
-  const digest = crypto.createHmac('sha256', PROXY_SECRET)
-    .update(message)
+    .join(''); // per App Proxy spec: concatenate without separators
+
+  const expected = crypto.createHmac('sha256', PROXY_SECRET)
+    .update(msg)
     .digest('hex');
-  return digest === signature;
+
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(expected, 'hex'),
+      Buffer.from(signature, 'hex')
+    );
+  } catch {
+    return false;
+  }
 }
 
-// Health check
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+// ---- App Proxy endpoint (Shopify forwards /apps/supporttickets/* here) ----
+app.get('/tickets/*', (req, res) => {
+  // Uncomment to enforce HMAC:
+  // if (!verifySignature(req.query)) return res.status(403).send('Invalid signature');
 
-// Your App Proxy base path (Render URL must end with /tickets/)
-app.get("/tickets/*", (req, res) => {
-  // OPTIONAL: uncomment to enforce HMAC
-  // if (!verifyHmac(req.query)) return res.status(403).send("Invalid signature");
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.status(200).send(`
     <div style="font-family:system-ui;padding:16px">
       <h2>ZUVIC Support Tickets</h2>
-      <p>This is the App Proxy endpoint responding at <code>/tickets</code>.</p>
+      <p>Proxy path: <code>${req.path}</code></p>
       <p>Next step: render the customer's tickets here.</p>
     </div>
   `);
 });
+
+// Fallback
+app.use((_req, res) => res.status(404).send('Not found'));
 
 app.listen(PORT, () => {
   console.log(`ZUVIC tickets service listening on :${PORT}`);
