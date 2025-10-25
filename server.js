@@ -7,7 +7,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "512kb" }));
 
 // ---- ENV (already set in your host)
-const PORT               = process.env.PORT || 3000;
+const PORT               = process.env.PORT || 10000;
 const PROXY_SECRET       = process.env.PROXY_SECRET || "";
 const PROXY_MOUNT        = process.env.PROXY_MOUNT || "/tickets";
 const PROXY_DEBUG        = process.env.PROXY_DEBUG === "1";  // optional
