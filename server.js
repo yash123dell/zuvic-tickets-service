@@ -8,9 +8,9 @@ app.use(express.json({ limit: "512kb" }));
 
 // ---- HARD-CODED CONFIG (put your real values here) ----
 const PORT         = 3000;                 // or whatever your host uses
-const PROXY_SECRET = "PUT_YOUR_SIGNING_SECRET_HERE"; // App proxy → Signing secret
-const PROXY_MOUNT  = "/tickets";           // because your Proxy URL ends with /tickets/
-const PROXY_DEBUG  = false;                // set true to log HMAC mismatches
+const PROXY_SECRET = "";
+const PROXY_MOUNT  = "/tickets";
+const PROXY_DEBUG  = true;                // set true to log HMAC mismatches
 // ------------------------------------------------------
 
 // Health
