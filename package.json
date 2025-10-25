@@ -1,13 +1,7 @@
 {
-  "name": "zuvic-tickets-service",
-  "version": "1.0.0",
-  "private": true,
   "type": "module",
-  "engines": { "node": "20.x" },
-  "scripts": {
-    "start": "node server.js",
-    "build": "echo \"no build step\""
-  },
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18 <21" },
   "dependencies": {
     "express": "^4.19.2"
   }
