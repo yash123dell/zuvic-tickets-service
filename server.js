@@ -7,7 +7,7 @@ app.disable("x-powered-by");
 app.use(express.json({ limit: "512kb" }));
 
 // Read from ENV (you already added GitHub/host secrets)
-const PORT         = process.env.PORT || 3000;
+const PORT         = process.env.PORT || 10000;
 const PROXY_SECRET = process.env.PROXY_SECRET || "";     // from secrets
 const PROXY_MOUNT  = process.env.PROXY_MOUNT || "/tickets"; // from secrets (/tickets)
 const PROXY_DEBUG  = process.env.PROXY_DEBUG === "1";    // optional
