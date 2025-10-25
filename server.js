@@ -10,7 +10,7 @@ app.use(express.json({ limit: "512kb" }));
 const PORT         = 3000;                 // or whatever your host uses
 const PROXY_SECRET = "";
 const PROXY_MOUNT  = "/tickets";
-const PROXY_DEBUG  = true;                // set true to log HMAC mismatches
+const PROXY_DEBUG  = false;
 // ------------------------------------------------------
 
 // Health
