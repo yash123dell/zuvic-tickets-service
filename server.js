@@ -218,7 +218,196 @@ app.get(`${PROXY_MOUNT}/find-ticket`, async (req, res) => {
     return res.status(500).json({ ok:false, error:String(e.message || e) });
   }
 });
+// ==== Admin UI key auth + CORS (add above app.listen) ====
+const ADMIN_UI_KEY = process.env.ADMIN_UI_KEY || "";
 
+function requireAdmin(req, res, next) {
+  const bearer = String(req.headers.authorization || "")
+    .replace(/^Bearer\s+/i, "")
+    .trim();
+  const xkey = String(req.headers["x-admin-ui-key"] || "").trim(); // optional alt header
+  if (ADMIN_UI_KEY && (bearer === ADMIN_UI_KEY || xkey === ADMIN_UI_KEY)) return next();
+  return res.status(401).json({ ok: false, error: "unauthorized" });
+}
+
+// (Optional) basic CORS so you can call from a browser tool
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*"); // tighten later if you host a UI
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-UI-Key");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+// Helper to pull orders in pages and flatten tickets
+async function collectTickets({ since, status, limit = 200 }) {
+  const out = [];
+  let after = null;
+  const max = Math.min(Number(limit || 200), 1000);
+  const shopQuery = since ? `updated_at:>=${since}` : null;
+
+  while (out.length < max) {
+    const q = `
+      query Orders($first:Int!,$after:String,$query:String){
+        orders(first:$first, after:$after, query:$query, sortKey:UPDATED_AT, reverse:true){
+          edges{
+            cursor
+            node{
+              id name createdAt updatedAt
+              customer{ displayName email phone }
+              mfJSON: metafield(namespace:"support", key:"tickets"){ value }
+              mfId:   metafield(namespace:"support", key:"ticket_id"){ value }
+              mfSt:   metafield(namespace:"support", key:"ticket_status"){ value }
+            }
+          }
+          pageInfo{ hasNextPage }
+        }
+      }`;
+    const data = await adminGraphQL(q, {
+      first: 50,
+      after,
+      query: shopQuery
+    });
+
+    const edges = data?.orders?.edges || [];
+    if (!edges.length) break;
+
+    for (const { cursor, node } of edges) {
+      const orderId = Number(String(node.id).split("/").pop());
+      const base = {
+        order_id: orderId,
+        order_name: node.name,
+        order_created_at: node.createdAt,
+        order_updated_at: node.updatedAt,
+        customer_email: node.customer?.email || "",
+        customer_name: node.customer?.displayName || ""
+      };
+
+      // Prefer JSON map
+      let map = {};
+      const raw = node.mfJSON?.value;
+      if (raw) { try { map = JSON.parse(raw); } catch (_) {} }
+
+      if (Object.keys(map).length) {
+        for (const [key, t] of Object.entries(map)) {
+          const rec = {
+            ...base,
+            ticket_id: t.ticket_id || key,
+            status: (t.status || "pending"),
+            issue: t.issue || "",
+            message: t.message || "",
+            phone: t.phone || "",
+            email: t.email || base.customer_email,
+            name:  t.name  || base.customer_name,
+            created_at: t.created_at || base.order_created_at,
+            updated_at: t.updated_at || base.order_updated_at
+          };
+          if (!status || status === "all" || rec.status.toLowerCase() === status.toLowerCase()) {
+            out.push(rec);
+            if (out.length >= max) break;
+          }
+        }
+      } else if (node.mfId?.value) {
+        // Fallback to single fields
+        const rec = {
+          ...base,
+          ticket_id: node.mfId.value,
+          status: node.mfSt?.value || "pending",
+          issue: "",
+          message: "",
+          phone: node.customer?.phone || "",
+          email: base.customer_email,
+          name:  base.customer_name,
+          created_at: base.order_created_at,
+          updated_at: base.order_updated_at
+        };
+        if (!status || status === "all" || rec.status.toLowerCase() === status.toLowerCase()) {
+          out.push(rec);
+        }
+      }
+      if (out.length >= max) break;
+    }
+
+    after = edges[edges.length - 1].cursor;
+    if (!data.orders.pageInfo.hasNextPage) break;
+  }
+
+  return out.slice(0, max);
+}
+
+// GET /admin/tickets?since=YYYY-MM-DD&status=pending|resolved|closed|in_progress|all&limit=200
+app.get("/admin/tickets", requireAdmin, async (req, res) => {
+  try {
+    const { since, status, limit } = req.query || {};
+    const tickets = await collectTickets({ since, status, limit });
+    res.json({ ok: true, count: tickets.length, tickets });
+  } catch (e) {
+    console.error("GET /admin/tickets", e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// POST /admin/tickets/update { order_id, ticket_id, status }
+app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
+  try {
+    const { order_id, ticket_id, status = "pending" } = req.body || {};
+    if (!order_id || !ticket_id) {
+      return res.status(400).json({ ok:false, error:"missing order_id/ticket_id" });
+    }
+    const orderGid = `gid://shopify/Order/${order_id}`;
+
+    // Read current JSON
+    const q1 = `
+      query GetOrder($id:ID!){
+        order(id:$id){
+          name
+          metafield(namespace:"support", key:"tickets"){ value }
+        }
+      }`;
+    const d1 = await adminGraphQL(q1, { id: orderGid });
+    let map = {};
+    const raw = d1?.order?.metafield?.value;
+    if (raw) { try { map = JSON.parse(raw); } catch (_) {} }
+
+    const now = new Date().toISOString();
+    const prev = map[ticket_id] || {};
+    map[ticket_id] = {
+      ...(prev||{}),
+      ticket_id,
+      status,
+      order_id,
+      order_name: prev.order_name || d1?.order?.name || "",
+      created_at: prev.created_at || now,
+      updated_at: now
+    };
+
+    const q2 = `
+      mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
+        metafieldsSet(metafields:[{
+          ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value
+        },{
+          ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid
+        },{
+          ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st
+        }]){
+          userErrors { field message }
+        }
+      }`;
+    const d2 = await adminGraphQL(q2, {
+      ownerId: orderGid,
+      value: JSON.stringify(map),
+      tid: ticket_id,
+      st: status
+    });
+    const err = d2?.metafieldsSet?.userErrors?.[0];
+    if (err) throw new Error(err.message);
+
+    res.json({ ok: true, ticket: map[ticket_id] });
+  } catch (e) {
+    console.error("POST /admin/tickets/update", e);
+    res.status(500).json({ ok:false, error:String(e.message || e) });
+  }
+});
 app.listen(PORT, () =>
   console.log(`[server] listening on :${PORT} mount=${PROXY_MOUNT} api=${API_VERSION}`)
 );
