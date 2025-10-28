@@ -17,7 +17,7 @@ import rateLimit from "express-rate-limit";
 import cookieParser from "cookie-parser";
 import { fileURLToPath } from "url";
 
-// Polyfill fetch if running on a Node build without global fetch
+// Polyfill fetch if needed
 if (!globalThis.fetch) {
   const { default: nodeFetch } = await import("node-fetch");
   globalThis.fetch = nodeFetch;
@@ -31,7 +31,6 @@ app.disable("x-powered-by");
 app.set("trust proxy", true);
 
 // ---------- middleware
-// We disable global CSP and set a route-specific CSP with a nonce on /admin/panel
 app.use(
   helmet({
     contentSecurityPolicy: false,
@@ -457,7 +456,7 @@ app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
 });
 
 // ======================================================================
-// Password-protected HTML Admin Panel (single-row tabs)
+// Password-protected HTML Admin Panel (white UI, no horizontal scroll)
 // ======================================================================
 const UI_USER = process.env.UI_USER || "admin";
 const UI_PASS = process.env.UI_PASS || "change-me";
@@ -537,20 +536,17 @@ app.get("/admin/logout", (req, res) => {
   res.status(401).send("Logged out");
 });
 
-// /admin/panel with CSP nonce so inline <script> executes safely
+// /admin/panel (white, no horizontal scroll, better actions, modal on ticket click)
 app.get("/admin/panel", requireUIPassword, (req, res) => {
   const panelPath = path.join(__dirname, "public", "admin-panel.html");
   if (fs.existsSync(panelPath)) return res.sendFile(panelPath);
 
-  // Per-request nonce for inline script
   const nonce = crypto.randomBytes(16).toString("base64");
-  // Route-specific CSP header that allows our inline script+inline styles
   res.setHeader(
     "Content-Security-Policy",
     `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'self'; frame-ancestors 'none'`
   );
 
-  // Single-line table UI + modal details
   res.type("html").send(`<!doctype html>
 <html lang="en">
 <head>
@@ -559,72 +555,65 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
 <title>ZUVIC • Support tickets</title>
 <style>
   :root{
-    --bg:#0b1220; --card:#0f172a; --fg:#e5e7eb; --muted:#94a3b8; --border:#1f2937;
-    --header:#0b1220; --headerfg:#9aa7bd; --primary:#2563eb; --accent:#60a5fa;
-    --pillbg:#0b2a55; --pillfg:#c7ddff;
+    --bg:#ffffff; --fg:#0f172a; --muted:#64748b; --card:#ffffff; --border:#e5e7eb; --primary:#1d4ed8;
+    --tab:#eef2ff; --tabfg:#3730a3; --row:#ffffff; --divider:#f1f5f9; --pill:#eef2ff; --pillfg:#1e3a8a;
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
-  a{color:var(--accent);text-decoration:none}
-  a:hover{opacity:.9}
+  a{color:var(--primary);text-decoration:none}
+
   .wrap{padding:24px;max-width:1400px;margin:0 auto}
   .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
   .title{font-size:28px;font-weight:700}
-  .logout{color:var(--accent);text-decoration:none}
+  .logout{color:var(--primary)}
 
   .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px}
 
-  /* Tabs single line */
-  .tabs{display:flex;gap:8px;flex-wrap:nowrap;overflow:auto;white-space:nowrap;margin-bottom:12px;-webkit-overflow-scrolling:touch}
-  .tab{padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:#0d1528;color:#dbe7ff;cursor:pointer}
+  /* Tabs single-row */
+  .tabs{display:flex;gap:8px;flex-wrap:nowrap;overflow:auto;white-space:nowrap;margin-bottom:12px}
+  .tab{padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:#fff;color:#111;cursor:pointer}
   .tab.active{background:var(--primary);border-color:var(--primary);color:#fff}
-  .tab .count{opacity:.85;margin-left:6px}
+  .count{opacity:.85;margin-left:6px}
 
   /* Filters */
-  .filters{display:grid;grid-template-columns:180px 180px 120px 1fr auto auto;gap:10px;margin-bottom:10px}
-  label{font-size:12px;color:var(--muted)}
-  select,input,button{width:100%;height:36px;border:1px solid var(--border);border-radius:8px;padding:0 10px;background:#0b1220;color:var(--fg)}
+  .filters{display:grid;grid-template-columns:180px 180px 120px 1fr auto auto;gap:10px;margin-bottom:10px;align-items:end}
+  label{font-size:12px;color:var(--muted);display:block}
+  select,input,button{width:100%;height:36px;border:1px solid var(--border);border-radius:8px;padding:0 10px;background:#fff;color:var(--fg)}
   button{border-color:var(--primary);background:var(--primary);color:#fff;cursor:pointer}
-  button.ghost{background:#0b1220}
+  .ghost{background:#fff;color:#111;border-color:var(--border)}
 
-  /* Table – single line with ellipsis */
-  .table-wrap{overflow:auto;border-radius:10px;border:1px solid var(--border);background:#0c1426}
-  table{width:100%;border-collapse:collapse;min-width:1100px;table-layout:fixed}
-  th,td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:middle;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  th{position:sticky;top:0;background:#0b1220;font-weight:600;color:var(--headerfg);z-index:1}
-  tr:nth-child(even){background:#0e1a31}
-  code{background:#0b1220;border:1px solid var(--border);border-radius:6px;padding:2px 6px}
-  .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--pillbg);color:var(--pillfg);font-size:12px}
-  .row-actions{display:flex;gap:8px;justify-content:flex-end}
+  /* Table (no horizontal scroll) */
+  .table-wrap{border-radius:12px;border:1px solid var(--border);background:#fff}
+  table{width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0}
+  thead th{position:sticky;top:0;background:#fff;border-bottom:1px solid var(--border);font-weight:600;color:#334155;padding:12px}
+  tbody td{padding:12px;border-bottom:1px solid var(--divider);vertical-align:middle}
+  tbody tr:last-child td{border-bottom:0}
+  td,th{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .muted{color:var(--muted)}
-  .toast{position:fixed;right:16px;bottom:16px;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s}
-  .toast.show{opacity:1;transform:translateY(0)}
+  .ord{font-weight:600}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--pill);color:var(--pillfg);font-size:12px}
+  .link{appearance:none;background:none;border:0;padding:0;color:var(--primary);cursor:pointer;font-weight:600}
 
-  /* Column widths (keep one line) */
-  .col-order{width:230px}
-  .col-ticket{width:210px}
-  .col-status{width:140px}
-  .col-issue{width:170px}
-  .col-customer{width:180px}
-  .col-created{width:170px}
-  .col-updated{width:170px}
-  .col-actions{width:120px}
-
-  /* Truncate helper */
-  .truncate{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* Actions cell */
+  .actions{display:flex;gap:8px;justify-content:flex-end;align-items:center}
+  .actions select{min-width:130px}
+  .actions button{min-width:76px}
 
   /* Modal */
-  .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;padding:16px}
-  .modal.show{display:flex}
-  .sheet{width:min(720px,100%);background:var(--card);border:1px solid var(--border);border-radius:14px}
-  .sheet .hd{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border)}
-  .sheet .bd{padding:16px;display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  .sheet .ft{display:flex;gap:8px;justify-content:flex-end;padding:12px 16px;border-top:1px solid var(--border)}
-  .kv{display:flex;flex-direction:column;gap:6px}
-  .kv label{font-size:12px;color:var(--muted)}
-  .kv input, .kv textarea, .kv select{height:38px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--fg);padding:0 10px}
-  .kv textarea{height:84px;padding:10px;resize:vertical}
-  .x{appearance:none;border:0;background:#172042;color:#cbd5e1;border-radius:8px;height:34px;padding:0 10px;cursor:pointer}
+  .overlay{position:fixed;inset:0;background:rgba(15,23,42,.35);display:none;align-items:center;justify-content:center;padding:16px}
+  .overlay.show{display:flex}
+  .modal{width:min(720px,96vw);background:#fff;border-radius:16px;border:1px solid var(--border);box-shadow:0 20px 60px rgba(0,0,0,.15);overflow:hidden}
+  .m-head{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+  .m-title{font-size:18px;font-weight:700}
+  .m-body{padding:16px;display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .m-row{display:flex;flex-direction:column}
+  .m-row label{font-size:12px;color:var(--muted);margin-bottom:6px}
+  .m-row input,.m-row textarea,.m-row select{height:38px;border:1px solid var(--border);border-radius:8px;padding:0 10px}
+  .m-row textarea{height:88px;padding:10px;resize:vertical}
+  .m-foot{padding:14px 16px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:10px}
+  .close{appearance:none;background:none;border:0;font-size:22px;line-height:22px;cursor:pointer;color:#334155}
+  .toast{position:fixed;right:16px;bottom:16px;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s}
+  .toast.show{opacity:1;transform:translateY(0)}
 </style>
 </head>
 <body>
@@ -635,8 +624,6 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   </div>
 
   <div class="card">
-
-    <!-- Single-line tabs -->
     <div class="tabs" id="tabs">
       <button class="tab active" data-status="all">All <span class="count" id="c_all">0</span></button>
       <button class="tab" data-status="pending">Pending <span class="count" id="c_pending">0</span></button>
@@ -645,7 +632,6 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
       <button class="tab" data-status="closed">Closed <span class="count" id="c_closed">0</span></button>
     </div>
 
-    <!-- Filters -->
     <div class="filters">
       <label>Status
         <select id="st">
@@ -672,75 +658,72 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
     <div id="err" class="muted" style="display:none"></div>
 
     <div class="table-wrap">
-      <table id="tbl">
+      <table id="tbl" aria-label="Tickets table">
         <thead>
           <tr>
-            <th class="col-order">Order</th>
-            <th class="col-ticket">Ticket</th>
-            <th class="col-status">Status</th>
-            <th class="col-issue">Issue</th>
-            <th class="col-customer">Customer</th>
-            <th class="col-created">Created</th>
-            <th class="col-updated">Updated</th>
-            <th class="col-actions">Actions</th>
+            <th>Order</th>
+            <th>Ticket</th>
+            <th>Status</th>
+            <th>Issue</th>
+            <th>Customer</th>
+            <th>Created</th>
+            <th>Updated</th>
+            <th>Actions</th>
           </tr>
         </thead>
-        <tbody><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
+        <tbody><tr><td colspan="8" class="muted" style="padding:16px">Loading…</td></tr></tbody>
       </table>
     </div>
   </div>
 </div>
 
-<div id="toast" class="toast"></div>
-
 <!-- Modal -->
-<div id="modal" class="modal" aria-hidden="true" role="dialog">
-  <div class="sheet" role="document">
-    <div class="hd">
-      <div id="m_title" class="truncate" style="max-width:80%"></div>
-      <button class="x" id="m_close">Close</button>
+<div id="dlg" class="overlay" role="dialog" aria-modal="true" aria-labelledby="dlg_title">
+  <div class="modal">
+    <div class="m-head">
+      <div id="dlg_title" class="m-title">Ticket</div>
+      <button class="close" aria-label="Close dialog">&times;</button>
     </div>
-    <div class="bd">
-      <div class="kv"><label>Order</label><input id="m_order" readonly></div>
-      <div class="kv"><label>Ticket</label><input id="m_ticket" readonly></div>
-      <div class="kv"><label>Status</label>
-        <select id="m_status">
+    <div class="m-body">
+      <div class="m-row"><label>Ticket ID</label><input id="d_tid" readonly/></div>
+      <div class="m-row"><label>Order</label><input id="d_order" readonly/></div>
+      <div class="m-row"><label>Status</label>
+        <select id="d_status">
           <option value="pending">pending</option>
           <option value="in_progress">in_progress</option>
           <option value="resolved">resolved</option>
           <option value="closed">closed</option>
         </select>
       </div>
-      <div class="kv"><label>Customer name</label><input id="m_name" readonly></div>
-      <div class="kv"><label>Email</label><input id="m_email" readonly></div>
-      <div class="kv"><label>Phone</label><input id="m_phone" readonly></div>
-      <div class="kv" style="grid-column:1/-1"><label>Issue</label><input id="m_issue" readonly></div>
-      <div class="kv" style="grid-column:1/-1"><label>Message</label><textarea id="m_message" readonly></textarea></div>
-      <div class="kv"><label>Created</label><input id="m_created" readonly></div>
-      <div class="kv"><label>Updated</label><input id="m_updated" readonly></div>
+      <div class="m-row"><label>Issue</label><input id="d_issue" readonly/></div>
+      <div class="m-row"><label>Name</label><input id="d_name" readonly/></div>
+      <div class="m-row"><label>Email</label><input id="d_email" readonly/></div>
+      <div class="m-row"><label>Phone</label><input id="d_phone" readonly/></div>
+      <div class="m-row"><label>Message</label><textarea id="d_message" readonly></textarea></div>
+      <div class="m-row"><label>Created</label><input id="d_created" readonly/></div>
+      <div class="m-row"><label>Updated</label><input id="d_updated" readonly/></div>
     </div>
-    <div class="ft">
-      <button class="x" id="m_cancel">Cancel</button>
-      <button id="m_save">Save</button>
+    <div class="m-foot">
+      <button id="d_save">Save</button>
+      <button class="ghost" id="d_close">Close</button>
     </div>
   </div>
 </div>
 
+<div id="toast" class="toast"></div>
+
 <script nonce="${nonce}">
-/* Helpers */
 const $  = (s)=>document.querySelector(s);
 const $$ = (s)=>document.querySelectorAll(s);
-const esc = (v)=> String(v ?? "").replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\\'':'&#39;'}[ch]));
+const esc = (v)=> String(v ?? "").replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 const fmt = (d)=> d ? new Date(d).toLocaleString() : "—";
 const show = (msg)=>{ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); };
 const pill = (s)=> '<span class="pill">'+esc(String(s||"").replace("_"," "))+'</span>';
-const trunc = (v)=> v ? esc(v) : "—";
+const cell = (v)=> v ? esc(v) : "—";
 
 let currentStatus = "all";
 let cacheTickets  = [];
-let currentIdx    = -1;
 
-/* Tabs & counts */
 function setActiveTab(status){
   currentStatus = status;
   $$("#tabs .tab").forEach(btn => btn.classList.toggle("active", btn.dataset.status===status));
@@ -757,47 +740,47 @@ function counts(list){
   $("#c_closed").textContent = c.closed;
 }
 
-/* Row template — all values single line with ellipsis; order shows both number & ID */
-function row(t,i){
-  const orderText = \`\${t.order_name||t.order_id||""} (ID:\${t.order_id||"-"})\`;
-  return \`<tr data-i="\${i}">
-    <td class="truncate" title="\${esc(orderText)}"><code>\${esc(orderText)}</code></td>
-    <td class="truncate" title="\${esc(t.ticket_id||"")}">
-      <a href="#" class="tk" data-i="\${i}"><code>\${esc(t.ticket_id||"")}</code></a>
-    </td>
-    <td>\${pill(t.status)}</td>
-    <td class="truncate" title="\${esc(t.issue||"")}">\${trunc(t.issue)}</td>
-    <td class="truncate" title="\${esc([t.name,t.email].filter(Boolean).join(" · "))}">\${esc(t.name||"—")}</td>
-    <td>\${fmt(t.created_at)}</td>
-    <td>\${fmt(t.updated_at)}</td>
-    <td class="row-actions">
-      <select class="set">
-        <option value="pending" \${t.status==="pending"?"selected":""}>pending</option>
-        <option value="in_progress" \${t.status==="in_progress"?"selected":""}>in_progress</option>
-        <option value="resolved" \${t.status==="resolved"?"selected":""}>resolved</option>
-        <option value="closed" \${t.status==="closed"?"selected":""}>closed</option>
-      </select>
-      <button class="save" data-oid="\${t.order_id}" data-tid="\${esc(t.ticket_id)}">Save</button>
-    </td>
-  </tr>\`;
+function orderCell(t){
+  const ord = esc(t.order_name || "");
+  const id  = esc(t.order_id || "");
+  return '<div class="ord">'+ord+'</div><div class="muted">ID: '+id+'</div>';
+}
+
+function row(t){
+  // ticket link opens modal
+  const tlink = '<button class="link ticket" data-oid="'+esc(t.order_id)+'" data-tid="'+esc(t.ticket_id)+'"> '+esc(t.ticket_id)+' </button>';
+  return '<tr>'+
+    '<td>'+orderCell(t)+'</td>'+
+    '<td>'+tlink+'</td>'+
+    '<td>'+pill(t.status)+'</td>'+
+    '<td title="'+esc(t.issue||"")+'">'+cell(t.issue)+'</td>'+
+    '<td title="'+esc(t.name||"")+'">'+cell(t.name)+'</td>'+
+    '<td>'+fmt(t.created_at)+'</td>'+
+    '<td>'+fmt(t.updated_at)+'</td>'+
+    '<td><div class="actions">'+
+      '<select class="set">'+
+        '<option value="pending" '+(t.status==="pending"?"selected":"")+'>pending</option>'+
+        '<option value="in_progress" '+(t.status==="in_progress"?"selected":"")+'>in_progress</option>'+
+        '<option value="resolved" '+(t.status==="resolved"?"selected":"")+'>resolved</option>'+
+        '<option value="closed" '+(t.status==="closed"?"selected":"")+'>closed</option>'+
+      '</select>'+
+      '<button class="save" data-oid="'+esc(t.order_id)+'" data-tid="'+esc(t.ticket_id)+'">Save</button>'+
+    '</div></td>'+
+  '</tr>';
 }
 
 function render(list){
   counts(list);
   const q = ($("#q").value||"").toLowerCase();
-  const rows = list
-    .map((t,i)=>({t,i}))
-    .filter(({t})=>{
-      const byStatus = currentStatus==="all" ? true : (String(t.status).toLowerCase()===currentStatus);
-      if (!byStatus) return false;
-      if (!q) return true;
-      return [t.ticket_id,t.order_name,t.order_id,t.name,t.email].filter(Boolean).some(x=>String(x).toLowerCase().includes(q));
-    })
-    .map(({t,i})=>row(t,i))
-    .join("") || '<tr><td colspan="8" class="muted">No tickets</td></tr>';
+  const rows = list.filter(t => {
+    const byStatus = currentStatus==="all" ? true : (String(t.status).toLowerCase()===currentStatus);
+    if (!byStatus) return false;
+    if (!q) return true;
+    return [t.ticket_id,t.order_name,t.name,t.email].filter(Boolean).some(x=>String(x).toLowerCase().includes(q));
+  }).map(row).join("") || '<tr><td colspan="8" class="muted" style="padding:16px">No tickets</td></tr>';
   $("#tbl tbody").innerHTML = rows;
 
-  /* Save buttons */
+  // bind actions
   $("#tbl").querySelectorAll(".save").forEach(btn=>{
     btn.onclick = async ()=>{
       const tr = btn.closest("tr");
@@ -809,57 +792,12 @@ function render(list){
       else { show("Updated"); load(); }
     };
   });
+
+  $("#tbl").querySelectorAll(".ticket").forEach(a=>{
+    a.onclick = ()=> openModal(a.dataset.oid, a.dataset.tid);
+  });
 }
 
-/* Modal controls */
-function openModal(idx){
-  const t = cacheTickets[idx]; if(!t) return;
-  currentIdx = idx;
-  $("#m_title").textContent = \`\${t.ticket_id} — \${t.order_name||t.order_id||""}\`;
-  $("#m_order").value   = \`\${t.order_name||""} (ID:\${t.order_id||"-"})\`;
-  $("#m_ticket").value  = t.ticket_id||"";
-  $("#m_status").value  = t.status||"pending";
-  $("#m_name").value    = t.name||"";
-  $("#m_email").value   = t.email||"";
-  $("#m_phone").value   = t.phone||"";
-  $("#m_issue").value   = t.issue||"";
-  $("#m_message").value = t.message||"";
-  $("#m_created").value = fmt(t.created_at);
-  $("#m_updated").value = fmt(t.updated_at);
-  $("#modal").classList.add("show");
-  $("#modal").setAttribute("aria-hidden","false");
-}
-function closeModal(){
-  $("#modal").classList.remove("show");
-  $("#modal").setAttribute("aria-hidden","true");
-  currentIdx = -1;
-}
-$("#m_close").onclick = closeModal;
-$("#m_cancel").onclick = closeModal;
-$("#modal").addEventListener("click",(e)=>{ if(e.target===e.currentTarget) closeModal(); });
-document.addEventListener("keydown",(e)=>{ if(e.key==="Escape") closeModal(); });
-
-$("#m_save").onclick = async ()=>{
-  if(currentIdx<0) return;
-  const t = cacheTickets[currentIdx];
-  const status = $("#m_status").value;
-  const body = { order_id: t.order_id, ticket_id: t.ticket_id, status };
-  const r2 = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
-  const j2 = await r2.json().catch(()=>({ok:false,error:"bad_json"}));
-  if(!j2.ok) alert("Update failed: " + j2.error);
-  else { show("Updated"); closeModal(); load(); }
-};
-
-/* Delegated click on Ticket link -> open modal */
-$("#tbl").addEventListener("click",(e)=>{
-  const a = e.target.closest("a.tk");
-  if(!a) return;
-  e.preventDefault();
-  const idx = Number(a.dataset.i||-1);
-  openModal(idx);
-});
-
-/* Load */
 async function load(){
   $("#err").style.display="none";
   const qs = new URLSearchParams({
@@ -871,19 +809,54 @@ async function load(){
   if (r.status === 401) { $("#err").textContent="Auth required. Reload the page."; $("#err").style.display="block"; return; }
   const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
   if(!j.ok && !Array.isArray(j.tickets)){ $("#err").textContent = "Failed: " + (j.error||"unexpected"); $("#err").style.display="block"; $("#tbl tbody").innerHTML=""; return; }
-  const list = Array.isArray(j.tickets) ? j.tickets : j;
+  const list = Array.isArray(j.tickets) ? j.tickets : j; // accept either {tickets:[]} or [] shape
   cacheTickets = list || [];
   render(cacheTickets);
 }
 
-/* Events */
+// ----- Modal helpers
+function fillModal(t){
+  $("#dlg_title").textContent = "Ticket • "+(t.ticket_id||"");
+  $("#d_tid").value = t.ticket_id||"";
+  $("#d_order").value = (t.order_name||"") + "   (ID: "+(t.order_id||"")+")";
+  $("#d_status").value = t.status||"pending";
+  $("#d_issue").value = t.issue||"";
+  $("#d_name").value = t.name||"";
+  $("#d_email").value = t.email||"";
+  $("#d_phone").value = t.phone||"";
+  $("#d_message").value = t.message||"";
+  $("#d_created").value = fmt(t.created_at);
+  $("#d_updated").value = fmt(t.updated_at);
+  $("#d_save").dataset.oid = t.order_id;
+  $("#d_save").dataset.tid = t.ticket_id;
+}
+function openModal(order_id, ticket_id){
+  const t = cacheTickets.find(x=> String(x.order_id)==String(order_id) && String(x.ticket_id)==String(ticket_id));
+  if(!t) return;
+  fillModal(t);
+  $("#dlg").classList.add("show");
+}
+function closeModal(){ $("#dlg").classList.remove("show"); }
+
+$("#d_close").onclick = closeModal;
+$(".close").onclick = closeModal;
+$("#dlg").addEventListener("click", (e)=>{ if(e.target.id==="dlg") closeModal(); });
+
+$("#d_save").onclick = async (e)=>{
+  const body = { order_id: e.target.dataset.oid, ticket_id: e.target.dataset.tid, status: $("#d_status").value };
+  const r = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
+  const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
+  if(!j.ok) alert("Update failed: " + j.error);
+  else { closeModal(); show("Updated"); load(); }
+};
+
+// bindings
 $("#tabs").addEventListener("click",(e)=>{ const b=e.target.closest(".tab"); if(b) setActiveTab(b.dataset.status); });
 $("#st").onchange = ()=> setActiveTab($("#st").value);
 $("#go").onclick  = load;
 $("#clr").onclick = ()=>{ $("#st").value="all"; $("#since").value=""; $("#lim").value=200; $("#q").value=""; setActiveTab("all"); load(); };
 $("#q").oninput   = ()=> render(cacheTickets);
 
-/* Init */
 load();
 </script>
 </body>
