@@ -4,9 +4,7 @@
   "private": true,
   "description": "ZUVIC Support Tickets service (Shopify App Proxy + Admin UI)",
   "type": "module",
-  "engines": {
-    "node": ">=18 <21"
-  },
+  "engines": { "node": ">=18 <21" },
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js"
@@ -15,10 +13,9 @@
     "cookie-parser": "^1.4.6",
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
-    "helmet": "^7.1.0"
+    "helmet": "^7.1.0",
+    "dotenv": "^16.4.5"          // ← add this
   },
-  "devDependencies": {
-    "nodemon": "^3.1.0"
-  },
+  "devDependencies": { "nodemon": "^3.1.0" },
   "license": "UNLICENSED"
 }
