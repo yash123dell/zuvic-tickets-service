@@ -148,13 +148,15 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
     };
 
     const d2 = await adminGraphQL(`
-      mutation SaveTickets($ownerId: ID!, $value: String!, $ticketId: String!, $status: String!) {
-        metafieldsSet(metafields: [
-          { ownerId:$ownerId, namespace:"support", key:"tickets",       type:"json",                   value:$value },
-          { ownerId:$ownerId, namespace:"support", key:"ticket_id",     type:"single_line_text_field", value:$ticketId },
-          { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$status }
+      mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
+        metafieldsSet(metafields:[
+          { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
+          { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
+          { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st }
         ]) { userErrors { field message } }
-      }`, { ownerId: orderGid, value: JSON.stringify(map), ticketId: ticket_id, status: st });
+      }`, // ← extra } here too
+      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: status }
+    );
 
     const err = d2?.metafieldsSet?.userErrors?.[0];
     if (err) throw new Error(err.message);
