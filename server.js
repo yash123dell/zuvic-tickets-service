@@ -2,15 +2,19 @@
 // ENVs:
 // - SHOPIFY_ADMIN_TOKEN, SHOPIFY_SHOP, PROXY_SECRET
 // - PROXY_MOUNT (default "/tickets")
-// - SHOPIFY_API_VERSION or API_VERSION (fallback to "2024-10")
-// - ADMIN_UI_KEY (Bearer for programmatic admin API)
-// - UI_USER, UI_PASS (for the password-protected HTML admin panel)
-// Optional: SKIP_PROXY_VERIFY=1 (skip App Proxy signature verification for local dev)
+// - SHOPIFY_API_VERSION or API_VERSION (fallback "2024-10")
+// - ADMIN_UI_KEY           (Bearer for programmatic admin API)
+// - UI_USER, UI_PASS       (Basic auth for HTML admin panel)
+// - UI_SESSION_SECRET      (signing key for admin UI cookie; defaults to ADMIN_UI_KEY or "change-me")
+// Optional: SKIP_PROXY_VERIFY=1  (skip App Proxy signature verification for local dev)
 
 import express from "express";
 import crypto from "crypto";
 import path from "path";
 import fs from "fs";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import cookieParser from "cookie-parser";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -18,35 +22,53 @@ const __dirname  = path.dirname(__filename);
 
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", true);
+
+// ---------- middleware
+app.use(helmet({ crossOriginResourcePolicy: { policy: "same-site" } }));
+app.use(rateLimit({ windowMs: 60_000, max: 180 }));
+app.use(cookieParser());
 app.use(express.json({ limit: "512kb" }));
+app.use(express.urlencoded({ extended: false }));
+app.use(
+  express.static(path.join(__dirname, "public"), {
+    setHeaders(res) {
+      res.setHeader("Cache-Control", "no-store, must-revalidate");
+      res.setHeader("Pragma", "no-cache");
+    },
+  })
+);
 
-// Serve /public (only used if you later add a real admin-panel.html file)
-app.use(express.static(path.join(__dirname, "public")));
-
+// ---------- env
 const PORT         = process.env.PORT || 3000;
 const PROXY_MOUNT  = process.env.PROXY_MOUNT || "/tickets";
 const PROXY_SECRET = process.env.PROXY_SECRET || "";
-const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP || "";  // e.g. zuvic-in.myshopify.com
+const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP || "";
 const ADMIN_TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN || "";
 const API_VERSION  = process.env.SHOPIFY_API_VERSION || process.env.API_VERSION || "2024-10";
 const SKIP_VERIFY  = process.env.SKIP_PROXY_VERIFY === "1";
 
-// ---- health
-app.get("/healthz", (_req, res) => res.type("text").send("ok"));
+// ---------- utils
+const health = (_req, res) => res.type("text").send("ok");
+app.get("/healthz", health);
 
-// ---- App Proxy signature helpers (Shopify computes HMAC over sorted query without "signature")
+function normalizeStatus(s) {
+  const v = String(s || "").toLowerCase();
+  if (v === "in progress" || v === "processing") return "in_progress";
+  if (["pending", "in_progress", "resolved", "closed", "all"].includes(v)) return v;
+  return "all";
+}
+
+// App Proxy signature helpers (HMAC over sorted query without "signature")
 function expectedHmacFromReq(req, secret) {
   const rawQs = (req.originalUrl.split("?")[1] || "");
   const usp = new URLSearchParams(rawQs);
   const pairs = [];
   for (const [k, v] of usp) if (k !== "signature") pairs.push([k, v]);
-  pairs.sort((a, b) =>
-    a[0] === b[0] ? String(a[1]).localeCompare(String(b[1])) : a[0].localeCompare(b[0])
-  );
+  pairs.sort((a, b) => (a[0] === b[0] ? String(a[1]).localeCompare(String(b[1])) : a[0].localeCompare(b[0])));
   const msg = pairs.map(([k, v]) => `${k}=${v}`).join("");
   return crypto.createHmac("sha256", secret).update(msg).digest("hex");
 }
-
 function verifyProxySignature(req) {
   if (SKIP_VERIFY) return true;
   const provided = String(req.query.signature || "").toLowerCase();
@@ -57,7 +79,7 @@ function verifyProxySignature(req) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-// ---- Admin GraphQL helper
+// Shopify Admin GraphQL helper
 async function adminGraphQL(query, variables = {}) {
   const url = `https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`;
   const r = await fetch(url, {
@@ -76,57 +98,41 @@ async function adminGraphQL(query, variables = {}) {
   return body.data;
 }
 
-// -----------------------------------------------
-// POST /attach-ticket  (called from /apps/support/attach-ticket)
-// Writes JSON map support.tickets + mirror text metafields
-// -----------------------------------------------
+// ======================================================================
+// App Proxy endpoints (used from your storefront app proxy)
+// ======================================================================
 app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
   try {
-    if (!verifyProxySignature(req)) {
-      return res.status(401).json({ ok: false, error: "invalid_signature" });
-    }
+    if (!verifyProxySignature(req)) return res.status(401).json({ ok: false, error: "invalid_signature" });
 
     const {
-      order_id,               // required numeric ID
-      ticket_id,              // required, e.g. "ZUVIC-AB12CD"
+      order_id, ticket_id,
       status = "pending",
-      issue = "",
-      message = "",
-      phone = "",
-      email = "",
-      name = "",
-      order_name = "",
-      created_at,             // optional client ts
+      issue = "", message = "", phone = "", email = "", name = "",
+      order_name = "", created_at
     } = req.body || {};
 
     if (!order_id || !ticket_id) {
-      return res.status(400).json({ ok: false, error: "missing_fields", fields: ["order_id","ticket_id"] });
+      return res.status(400).json({ ok: false, error: "missing_fields", fields: ["order_id", "ticket_id"] });
     }
 
+    const st = normalizeStatus(status);
     const orderGid = `gid://shopify/Order/${String(order_id)}`;
 
-    // 1) Read existing support.tickets
-    const q1 = `
+    const d1 = await adminGraphQL(`
       query GetOrder($id: ID!) {
-        order(id: $id) {
-          id
-          name
-          tickets: metafield(namespace:"support", key:"tickets") { id value }
-        }
-      }
-    `;
-    const d1 = await adminGraphQL(q1, { id: orderGid });
+        order(id: $id) { id name tickets: metafield(namespace:"support", key:"tickets"){ id value } }
+      }`, { id: orderGid });
 
     let map = {};
     const mf = d1?.order?.tickets;
     if (mf?.value) { try { map = JSON.parse(mf.value); } catch { map = {}; } }
 
-    // 2) Upsert this ticket
-    const now = new Date().toISOString();
+    const now  = new Date().toISOString();
     const prev = map[ticket_id] || {};
     map[ticket_id] = {
       ticket_id,
-      status,
+      status: st,
       issue:   issue   || prev.issue   || "",
       message: message || prev.message || "",
       phone:   phone   || prev.phone   || "",
@@ -138,77 +144,56 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
       updated_at: now,
     };
 
-    // 3) Save JSON metafield + mirrors
-    const q2 = `
+    const d2 = await adminGraphQL(`
       mutation SaveTickets($ownerId: ID!, $value: String!, $ticketId: String!, $status: String!) {
         metafieldsSet(metafields: [
           { ownerId:$ownerId, namespace:"support", key:"tickets",       type:"json",                   value:$value },
           { ownerId:$ownerId, namespace:"support", key:"ticket_id",     type:"single_line_text_field", value:$ticketId },
           { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$status }
         ]) { userErrors { field message } }
-      }
-    `;
-    const d2 = await adminGraphQL(q2, { ownerId: orderGid, value: JSON.stringify(map), ticketId: ticket_id, status });
+      }`, { ownerId: orderGid, value: JSON.stringify(map), ticketId: ticket_id, status: st });
 
     const err = d2?.metafieldsSet?.userErrors?.[0];
     if (err) throw new Error(err.message);
 
-    return res.json({ ok: true, ticket: map[ticket_id] });
+    res.json({ ok: true, ticket: map[ticket_id] });
   } catch (e) {
     console.error("[attach-ticket]", e);
-    return res.status(500).json({ ok: false, error: String(e.message || e) });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
-// -----------------------------------------------
-// GET /find-ticket  (called from /apps/support/find-ticket)
-// Looks up a ticket by ticket_id on a specific order_id
-// -----------------------------------------------
 app.get(`${PROXY_MOUNT}/find-ticket`, async (req, res) => {
   try {
-    if (!verifyProxySignature(req)) {
-      return res.status(401).json({ ok: false, error: "invalid_signature" });
-    }
+    if (!verifyProxySignature(req)) return res.status(401).json({ ok:false, error:"invalid_signature" });
 
     const ticket_id = String(req.query.ticket_id || "").trim();
     const order_id  = String(req.query.order_id  || "").trim();
-
     if (!ticket_id) return res.status(400).json({ ok:false, error:"missing ticket_id" });
     if (!order_id)  return res.status(400).json({ ok:false, error:"missing order_id" });
 
     const orderGid = `gid://shopify/Order/${order_id}`;
-    const q = `
+    const d = await adminGraphQL(`
       query GetOrderForTicket($id: ID!) {
         order(id: $id) {
-          id
-          name
-          createdAt
-          tickets:     metafield(namespace:"support", key:"tickets")       { value }
-          tId:         metafield(namespace:"support", key:"ticket_id")     { value }
-          tStatus:     metafield(namespace:"support", key:"ticket_status") { value }
+          id name createdAt
+          tickets: metafield(namespace:"support", key:"tickets"){ value }
+          tId:     metafield(namespace:"support", key:"ticket_id"){ value }
+          tStatus: metafield(namespace:"support", key:"ticket_status"){ value }
         }
-      }
-    `;
-    const d = await adminGraphQL(q, { id: orderGid });
+      }`, { id: orderGid });
+
     const order = d?.order;
     if (!order) return res.json({ ok:false, error:"order_not_found" });
 
-    let ticket = null;
-    let status = null;
+    let ticket=null, status=null;
 
-    // Preferred: JSON map
     const json = order.tickets?.value;
-    if (json) {
-      try {
-        const map = JSON.parse(json);
-        if (map && map[ticket_id]) {
-          ticket = map[ticket_id];
-          status = ticket.status || null;
-        }
-      } catch {}
-    }
+    if (json) try {
+      const map = JSON.parse(json);
+      if (map && map[ticket_id]) { ticket = map[ticket_id]; status = ticket.status || null; }
+    } catch {}
 
-    // Fallback: mirror text metafields
     if (!ticket && order.tId?.value === ticket_id) {
       ticket = { ticket_id, status: order.tStatus?.value || "pending" };
       status = ticket.status;
@@ -216,42 +201,30 @@ app.get(`${PROXY_MOUNT}/find-ticket`, async (req, res) => {
 
     if (!ticket) return res.json({ ok:false, error:"ticket_not_found" });
 
-    return res.json({
-      ok: true,
-      ticket,
-      status: status || "pending",
-      order_id,
-      order_name: order.name,
-      order_created_at: order.createdAt
-    });
+    res.json({ ok:true, ticket, status: status || "pending", order_id, order_name: order.name, order_created_at: order.createdAt });
   } catch (e) {
     console.error("[find-ticket]", e);
-    return res.status(500).json({ ok:false, error:String(e.message || e) });
+    res.status(500).json({ ok:false, error:String(e.message||e) });
   }
 });
 
-// ==== Admin (Bearer) endpoints ====
+// ======================================================================
+/** Admin (Bearer) API — for programmatic use **/
 const ADMIN_UI_KEY = process.env.ADMIN_UI_KEY || "";
-
 function requireAdmin(req, res, next) {
-  const bearer = String(req.headers.authorization || "")
-    .replace(/^Bearer\s+/i, "")
-    .trim();
-  const xkey = String(req.headers["x-admin-ui-key"] || "").trim(); // optional alt header
+  const bearer = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  const xkey   = String(req.headers["x-admin-ui-key"] || "").trim();
   if (ADMIN_UI_KEY && (bearer === ADMIN_UI_KEY || xkey === ADMIN_UI_KEY)) return next();
-  return res.status(401).json({ ok: false, error: "unauthorized" });
+  return res.status(401).json({ ok:false, error:"unauthorized" });
 }
-
-// (Optional) basic CORS so you can call from a browser tool
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-UI-Key");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+app.use((req,res,next)=>{
+  res.setHeader("Access-Control-Allow-Origin","*");
+  res.setHeader("Access-Control-Allow-Headers","Content-Type, Authorization, X-Admin-UI-Key");
+  res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// Helper to pull orders in pages and flatten tickets (NO PII requested)
 async function collectTickets({ since, status, limit = 200 }) {
   const out = [];
   let after = null;
@@ -259,16 +232,13 @@ async function collectTickets({ since, status, limit = 200 }) {
   const shopQuery = since ? `updated_at:>=${since}` : null;
 
   while (out.length < max) {
-    const q = `
+    const data = await adminGraphQL(`
       query Orders($first:Int!,$after:String,$query:String){
         orders(first:$first, after:$after, query:$query, sortKey:UPDATED_AT, reverse:true){
           edges{
             cursor
             node{
-              id
-              name
-              createdAt
-              updatedAt
+              id name createdAt updatedAt
               mfJSON: metafield(namespace:"support", key:"tickets"){ value }
               mfId:   metafield(namespace:"support", key:"ticket_id"){ value }
               mfSt:   metafield(namespace:"support", key:"ticket_status"){ value }
@@ -276,12 +246,7 @@ async function collectTickets({ since, status, limit = 200 }) {
           }
           pageInfo{ hasNextPage }
         }
-      }`;
-    const data = await adminGraphQL(q, {
-      first: 50,
-      after,
-      query: shopQuery
-    });
+      }`, { first: 50, after, query: shopQuery });
 
     const edges = data?.orders?.edges || [];
     if (!edges.length) break;
@@ -292,322 +257,395 @@ async function collectTickets({ since, status, limit = 200 }) {
         order_id: orderId,
         order_name: node.name,
         order_created_at: node.createdAt,
-        order_updated_at: node.updatedAt
+        order_updated_at: node.updatedAt,
       };
 
-      // Prefer JSON map
       let map = {};
       const raw = node.mfJSON?.value;
-      if (raw) { try { map = JSON.parse(raw); } catch (_) {} }
+      if (raw) { try { map = JSON.parse(raw); } catch {} }
 
       if (Object.keys(map).length) {
         for (const [key, t] of Object.entries(map)) {
           const rec = {
             ...base,
             ticket_id: t.ticket_id || key,
-            status: (t.status || "pending"),
+            status: normalizeStatus(t.status) || "pending",
             issue: t.issue || "",
             message: t.message || "",
             phone: t.phone || "",
             email: t.email || "",
             name:  t.name  || "",
             created_at: t.created_at || base.order_created_at,
-            updated_at: t.updated_at || base.order_updated_at
+            updated_at: t.updated_at || base.order_updated_at,
           };
-          if (!status || status === "all" || rec.status.toLowerCase() === String(status).toLowerCase()) {
+          if (!status || status === "all" || rec.status === normalizeStatus(status)) {
             out.push(rec);
             if (out.length >= max) break;
           }
         }
       } else if (node.mfId?.value) {
-        // Fallback to single fields
         const rec = {
           ...base,
           ticket_id: node.mfId.value,
-          status: node.mfSt?.value || "pending",
-          issue: "",
-          message: "",
-          phone: "",
-          email: "",
-          name:  "",
+          status: normalizeStatus(node.mfSt?.value || "pending"),
+          issue: "", message: "", phone: "", email: "", name: "",
           created_at: base.order_created_at,
-          updated_at: base.order_updated_at
+          updated_at: base.order_updated_at,
         };
-        if (!status || status === "all" || rec.status.toLowerCase() === String(status).toLowerCase()) {
-          out.push(rec);
-        }
+        if (!status || status === "all" || rec.status === normalizeStatus(status)) out.push(rec);
       }
       if (out.length >= max) break;
+      after = cursor;
     }
-
-    after = edges[edges.length - 1].cursor;
-    if (!data.orders.pageInfo.hasNextPage) break;
+    if (!data?.orders?.pageInfo?.hasNextPage) break;
   }
 
   return out.slice(0, max);
 }
 
-// GET /admin/tickets?since=YYYY-MM-DD&status=pending|resolved|closed|in_progress|all&limit=200
 app.get("/admin/tickets", requireAdmin, async (req, res) => {
   try {
     const { since, status, limit } = req.query || {};
-    const tickets = await collectTickets({ since, status, limit });
+    const tickets = await collectTickets({ since, status: normalizeStatus(status), limit });
     res.json({ ok: true, count: tickets.length, tickets });
   } catch (e) {
     console.error("GET /admin/tickets", e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    res.status(500).json({ ok:false, error:String(e.message||e) });
   }
 });
 
-// POST /admin/tickets/update { order_id, ticket_id, status }
 app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
   try {
-    const { order_id, ticket_id, status = "pending" } = req.body || {};
-    if (!order_id || !ticket_id) {
-      return res.status(400).json({ ok:false, error:"missing order_id/ticket_id" });
-    }
-    const orderGid = `gid://shopify/Order/${order_id}`;
+    const { order_id, ticket_id } = req.body || {};
+    const status = normalizeStatus(req.body?.status || "pending");
+    if (!order_id || !ticket_id) return res.status(400).json({ ok:false, error:"missing order_id/ticket_id" });
 
-    // Read current JSON
-    const q1 = `
+    const orderGid = `gid://shopify/Order/${order_id}`;
+    const d1 = await adminGraphQL(`
       query GetOrder($id:ID!){
-        order(id:$id){
-          name
-          metafield(namespace:"support", key:"tickets"){ value }
-        }
-      }`;
-    const d1 = await adminGraphQL(q1, { id: orderGid });
+        order(id:$id){ name metafield(namespace:"support", key:"tickets"){ value } }
+      }`, { id: orderGid });
+
     let map = {};
     const raw = d1?.order?.metafield?.value;
-    if (raw) { try { map = JSON.parse(raw); } catch (_) {} }
+    if (raw) { try { map = JSON.parse(raw); } catch {} }
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
     map[ticket_id] = {
-      ...(prev||{}),
-      ticket_id,
-      status,
-      order_id,
+      ...(prev || {}),
+      ticket_id, status, order_id,
       order_name: prev.order_name || d1?.order?.name || "",
       created_at: prev.created_at || now,
-      updated_at: now
+      updated_at: now,
     };
 
-    const q2 = `
+    const d2 = await adminGraphQL(`
       mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
-        metafieldsSet(metafields:[{
-          ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value
-        },{
-          ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid
-        },{
-          ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st
-        }]){
-          userErrors { field message }
-        }
-      }`;
-    const d2 = await adminGraphQL(q2, {
-      ownerId: orderGid,
-      value: JSON.stringify(map),
-      tid: ticket_id,
-      st: status
-    });
+        metafieldsSet(metafields:[
+          { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
+          { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
+          { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st }
+        ]){ userErrors { field message } }`,
+      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: status });
+
     const err = d2?.metafieldsSet?.userErrors?.[0];
     if (err) throw new Error(err.message);
 
-    res.json({ ok: true, ticket: map[ticket_id] });
+    res.json({ ok:true, ticket: map[ticket_id] });
   } catch (e) {
     console.error("POST /admin/tickets/update", e);
-    res.status(500).json({ ok:false, error:String(e.message || e) });
+    res.status(500).json({ ok:false, error:String(e.message||e) });
   }
 });
 
-// ===== Optional: password-protected HTML admin panel =====
+// ======================================================================
+// Password-protected HTML Admin Panel (single-row tabs)
+// Uses Basic for first page load, then a signed cookie so XHR works.
+// ======================================================================
 const UI_USER = process.env.UI_USER || "admin";
 const UI_PASS = process.env.UI_PASS || "change-me";
+const UI_SESSION_SECRET = process.env.UI_SESSION_SECRET || ADMIN_UI_KEY || "change-me";
+function sign(s){ return crypto.createHmac("sha256", UI_SESSION_SECRET).update(s).digest("hex"); }
+function makeToken(hours=12){ const exp=Date.now()+hours*3600*1000; const p=String(exp); return `${p}.${sign(p)}`; }
+function verifyToken(t){ if(!t) return false; const [exp,sig]=String(t).split("."); return (sig===sign(exp)) && (+exp > Date.now()); }
+function isSecure(req){ return (req.headers["x-forwarded-proto"] || req.protocol) === "https"; }
 
 function requireUIPassword(req, res, next) {
+  res.set("Cache-Control", "no-store, must-revalidate"); res.set("Pragma","no-cache");
   const hdr = req.headers.authorization || "";
   if (!hdr.startsWith("Basic ")) {
-    res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"');
-    return res.status(401).send("Auth required");
+    res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"'); return res.status(401).send("Auth required");
   }
   const [user, pass] = Buffer.from(hdr.split(" ")[1], "base64").toString("utf8").split(":");
-  if (user === UI_USER && pass === UI_PASS) return next();
-  res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"');
-  return res.status(401).send("Auth required");
+  if (user === UI_USER && pass === UI_PASS) {
+    const token = makeToken(12);
+    res.cookie("ui_session", token, { httpOnly:true, sameSite:"Strict", secure:isSecure(req), path:"/admin" });
+    return next();
+  }
+  res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"'); return res.status(401).send("Auth required");
+}
+function requireUIAuth(req, res, next) {
+  const tok = req.cookies?.ui_session;
+  if (tok && verifyToken(tok)) return next();
+  return requireUIPassword(req, res, next);
 }
 
-// Serve the HTML panel (open /admin/panel). If the file is missing, serve an inline fallback.
+app.get("/admin/logout", (req,res)=>{
+  res.clearCookie("ui_session", { path:"/admin" });
+  res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"');
+  res.status(401).send("Logged out");
+});
+
+// Serve panel
 app.get("/admin/panel", requireUIPassword, (req, res) => {
   const panelPath = path.join(__dirname, "public", "admin-panel.html");
-  if (fs.existsSync(panelPath)) {
-    return res.sendFile(panelPath);
-  }
-  // Fallback inline HTML so you never see 404/ENOENT
+  if (fs.existsSync(panelPath)) return res.sendFile(panelPath);
+
+  // Inline fallback UI
   res.type("html").send(`<!doctype html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>Support tickets</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f6f7fb;margin:0;padding:24px;color:#0f172a}
-    h1{margin:0 0 16px}
-    .card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:20px}
-    .grid{display:grid;gap:12px;grid-template-columns:180px 180px 120px 1fr auto auto}
-    table{width:100%;border-collapse:collapse;margin-top:14px}
-    th,td{padding:10px;border-bottom:1px solid #eee;font-size:14px}
-    th{font-weight:600;color:#334155;text-align:left}
-    input,select,button{height:36px;border:1px solid #cbd5e1;border-radius:8px;padding:0 10px;background:#fff}
-    button{background:#1d4ed8;color:#fff;border-color:#1d4ed8;cursor:pointer}
-    .muted{color:#64748b}
-    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px}
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ZUVIC • Support tickets</title>
+<style>
+  :root{ --bg:#f6f7fb; --fg:#0f172a; --muted:#64748b; --card:#fff; --border:#e5e7eb; --primary:#1d4ed8;
+         --tab:#eef2ff; --tabfg:#3730a3; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  .wrap{padding:24px;max-width:1400px;margin:0 auto}
+  .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+  .title{font-size:28px;font-weight:700}
+  .logout{color:var(--primary);text-decoration:none}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px}
+
+  /* Single-row Tabs */
+  .tabs{display:flex;gap:8px;flex-wrap:nowrap;overflow:auto;white-space:nowrap;margin-bottom:12px;-webkit-overflow-scrolling:touch}
+  .tab{padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:#fff;color:#111;cursor:pointer}
+  .tab.active{background:var(--primary);border-color:var(--primary);color:#fff}
+  .tab .count{opacity:.85;margin-left:6px}
+
+  /* Filters */
+  .filters{display:grid;grid-template-columns:180px 180px 120px 1fr auto auto;gap:10px;margin-bottom:10px}
+  label{font-size:12px;color:var(--muted)}
+  select,input,button{width:100%;height:36px;border:1px solid var(--border);border-radius:8px;padding:0 10px;background:#fff;color:var(--fg)}
+  button{border-color:var(--primary);background:var(--primary);color:#fff;cursor:pointer}
+  button.ghost{background:#fff;color:var(--fg)}
+
+  /* Table */
+  .table-wrap{overflow:auto;border-radius:10px;border:1px solid var(--border);background:#fff}
+  table{width:100%;border-collapse:collapse;min-width:1100px}
+  th,td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{position:sticky;top:0;background:#fafafa;font-weight:600;color:#334155;z-index:1}
+  tr:nth-child(even){background:#fcfcff}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--tab);color:var(--tabfg);font-size:12px}
+  .muted{color:var(--muted)}
+  code{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:2px 6px}
+  .row-actions{display:flex;gap:8px}
+  .toast{position:fixed;right:16px;bottom:16px;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s}
+  .toast.show{opacity:1;transform:translateY(0)}
+</style>
 </head>
 <body>
-  <h1>Support tickets</h1>
-  <div class="card">
-    <div class="grid">
-      <label>Status
-        <select id="st"><option value="all">All</option><option>pending</option><option>in_progress</option><option>resolved</option><option>closed</option></select>
-      </label>
-      <label>Updated since
-        <input id="since" type="date" />
-      </label>
-      <label>Limit
-        <input id="lim" type="number" value="200" min="1" max="1000" />
-      </label>
-      <label>Search (ticket/order/name/email)
-        <input id="q" placeholder="Type to filter…" />
-      </label>
-      <button id="go">Refresh</button>
-      <button id="clr" type="button">Clear</button>
-    </div>
-
-    <div id="err" class="muted" style="margin-top:10px;display:none"></div>
-
-    <table id="tbl">
-      <thead>
-        <tr>
-          <th>TICKET</th><th>STATUS</th><th>ORDER</th><th>CREATED</th><th>UPDATED</th>
-          <th>NAME</th><th>EMAIL</th><th>PHONE</th><th>ISSUE</th><th>MESSAGE</th><th>ACTIONS</th>
-        </tr>
-      </thead>
-      <tbody><tr><td colspan="11" class="muted">Loading…</td></tr></tbody>
-    </table>
+<div class="wrap">
+  <div class="topbar">
+    <div class="title">Support tickets</div>
+    <a class="logout" href="/admin/logout" title="Log out">Logout</a>
   </div>
 
+  <div class="card">
+
+    <!-- Single-line tabs -->
+    <div class="tabs" id="tabs">
+      <button class="tab active" data-status="all">All <span class="count" id="c_all">0</span></button>
+      <button class="tab" data-status="pending">Pending <span class="count" id="c_pending">0</span></button>
+      <button class="tab" data-status="in_progress">In progress <span class="count" id="c_in_progress">0</span></button>
+      <button class="tab" data-status="resolved">Resolved <span class="count" id="c_resolved">0</span></button>
+      <button class="tab" data-status="closed">Closed <span class="count" id="c_closed">0</span></button>
+    </div>
+
+    <!-- Filters -->
+    <div class="filters">
+      <label>Status
+        <select id="st">
+          <option value="all">All</option>
+          <option value="pending">pending</option>
+          <option value="in_progress">in_progress</option>
+          <option value="resolved">resolved</option>
+          <option value="closed">closed</option>
+        </select>
+      </label>
+      <label>Updated since
+        <input id="since" type="date"/>
+      </label>
+      <label>Limit
+        <input id="lim" type="number" value="200" min="1" max="1000"/>
+      </label>
+      <label>Search (ticket/order/name/email)
+        <input id="q" placeholder="Type to filter…"/>
+      </label>
+      <button id="go">Refresh</button>
+      <button id="clr" class="ghost" type="button">Clear</button>
+    </div>
+
+    <div id="err" class="muted" style="display:none"></div>
+
+    <div class="table-wrap">
+      <table id="tbl">
+        <thead>
+          <tr>
+            <th>TICKET</th><th>STATUS</th><th>ORDER</th>
+            <th>CREATED</th><th>UPDATED</th>
+            <th>NAME</th><th>EMAIL</th><th>PHONE</th>
+            <th>ISSUE</th><th>MESSAGE</th><th style="width:200px">ACTIONS</th>
+          </tr>
+        </thead>
+        <tbody><tr><td colspan="11" class="muted">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
 <script>
-const $ = (s)=>document.querySelector(s);
-const fmt = (d)=> new Date(d).toLocaleString();
-const row = (t) => \`
-<tr>
-  <td><code>\${t.ticket_id||""}</code></td>
-  <td><span class="pill">\${(t.status||"").replace("_"," ")}</span></td>
-  <td><code>\${t.order_name||t.order_id||""}</code></td>
-  <td>\${t.created_at?fmt(t.created_at):""}</td>
-  <td>\${t.updated_at?fmt(t.updated_at):""}</td>
-  <td>\${t.name||""}</td>
-  <td>\${t.email||""}</td>
-  <td>\${t.phone||""}</td>
-  <td>\${t.issue||""}</td>
-  <td>\${t.message||""}</td>
-  <td>
-    <select class="set">
-      <option value="pending" \${t.status==="pending"?"selected":""}>pending</option>
-      <option value="in_progress" \${t.status==="in_progress"?"selected":""}>in_progress</option>
-      <option value="resolved" \${t.status==="resolved"?"selected":""}>resolved</option>
-      <option value="closed" \${t.status==="closed"?"selected":""}>closed</option>
-    </select>
-    <button class="save" data-oid="\${t.order_id}" data-tid="\${t.ticket_id}">Save</button>
-  </td>
-</tr>\`;
+const $  = (s)=>document.querySelector(s);
+const $$ = (s)=>document.querySelectorAll(s);
+const esc = (v)=>String(v ?? "").replace(/[&<>\"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',\"'\":'&#39;'}[ch]));
+const fmt = (d)=> d ? new Date(d).toLocaleString() : "—";
+const show = (msg)=>{ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); };
+const pill = (s)=> '<span class="pill">'+esc(String(s||"").replace("_"," "))+'</span>';
+const cell = (v)=> v ? esc(v) : "—";
 
-async function load(){
-  $("#err").style.display="none";
-  const qs = new URLSearchParams({
-    status: $("#st").value || "all",
-    since:  $("#since").value || "",
-    limit:  $("#lim").value || 200
-  });
-  const r = await fetch("/admin/ui/tickets?"+qs.toString(), {credentials:"include"});
-  const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
-  if(!j.ok){ $("#err").textContent = "Failed: " + j.error; $("#err").style.display="block"; $("#tbl tbody").innerHTML=""; return; }
+let currentStatus = "all";
+let cacheTickets  = [];
+
+function setActiveTab(status){
+  currentStatus = status;
+  $$("#tabs .tab").forEach(btn => btn.classList.toggle("active", btn.dataset.status===status));
+  $("#st").value = status;
+  render(cacheTickets);
+}
+function counts(list){
+  const c = { all:list.length, pending:0, in_progress:0, resolved:0, closed:0 };
+  list.forEach(t => { const s=(t.status||"pending").toLowerCase(); if (c[s]!==undefined) c[s]++; });
+  $("#c_all").textContent = c.all;
+  $("#c_pending").textContent = c.pending;
+  $("#c_in_progress").textContent = c.in_progress;
+  $("#c_resolved").textContent = c.resolved;
+  $("#c_closed").textContent = c.closed;
+}
+function row(t){
+  return \`<tr>
+    <td><code>\${esc(t.ticket_id||"")}</code></td>
+    <td>\${pill(t.status)}</td>
+    <td><code>\${esc(t.order_name||t.order_id||"")}</code></td>
+    <td>\${fmt(t.created_at)}</td>
+    <td>\${fmt(t.updated_at)}</td>
+    <td>\${cell(t.name)}</td>
+    <td>\${cell(t.email)}</td>
+    <td>\${cell(t.phone)}</td>
+    <td>\${cell(t.issue)}</td>
+    <td>\${cell(t.message)}</td>
+    <td class="row-actions">
+      <select class="set">
+        <option value="pending" \${t.status==="pending"?"selected":""}>pending</option>
+        <option value="in_progress" \${t.status==="in_progress"?"selected":""}>in_progress</option>
+        <option value="resolved" \${t.status==="resolved"?"selected":""}>resolved</option>
+        <option value="closed" \${t.status==="closed"?"selected":""}>closed</option>
+      </select>
+      <button class="save" data-oid="\${t.order_id}" data-tid="\${esc(t.ticket_id)}">Save</button>
+    </td>
+  </tr>\`;
+}
+function render(list){
+  counts(list);
   const q = ($("#q").value||"").toLowerCase();
-  const rows = j.tickets.filter(t =>
-    !q || [t.ticket_id,t.order_name,t.name,t.email].filter(Boolean).some(x=>String(x).toLowerCase().includes(q))
-  ).map(row).join("");
-  $("#tbl tbody").innerHTML = rows || '<tr><td colspan="11" class="muted">No tickets</td></tr>';
+  const rows = list.filter(t => {
+    const byStatus = currentStatus==="all" ? true : (String(t.status).toLowerCase()===currentStatus);
+    if (!byStatus) return false;
+    if (!q) return true;
+    return [t.ticket_id,t.order_name,t.name,t.email].filter(Boolean).some(x=>String(x).toLowerCase().includes(q));
+  }).map(row).join("") || '<tr><td colspan="11" class="muted">No tickets</td></tr>';
+  $("#tbl tbody").innerHTML = rows;
 
-  // wire saves
   $("#tbl").querySelectorAll(".save").forEach(btn=>{
     btn.onclick = async ()=>{
       const tr = btn.closest("tr");
       const status = tr.querySelector(".set").value;
       const body = { order_id: btn.dataset.oid, ticket_id: btn.dataset.tid, status };
-      const r2 = await fetch("/admin/ui/update",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body), credentials:"include"});
+      const r2 = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
       const j2 = await r2.json();
       if(!j2.ok) alert("Update failed: " + j2.error);
-      else load();
+      else { show("Updated"); load(); }
     };
   });
 }
-
-$("#go").onclick = load;
-$("#clr").onclick = ()=>{ $("#st").value="all"; $("#since").value=""; $("#lim").value=200; $("#q").value=""; load(); };
-$("#q").oninput = ()=> load();
+async function load(){
+  $("#err").style.display="none";
+  const qs = new URLSearchParams({
+    status: $("#st").value || "all",
+    since:  $("#since").value || "",
+    limit:  $("#lim").value  || 200
+  });
+  const r = await fetch("/admin/ui/tickets?"+qs.toString(), { credentials:"include" });
+  const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
+  if(!j.ok){ $("#err").textContent = "Failed: " + j.error; $("#err").style.display="block"; $("#tbl tbody").innerHTML=""; return; }
+  cacheTickets = j.tickets || [];
+  render(cacheTickets);
+}
+$("#tabs").addEventListener("click",(e)=>{ const b=e.target.closest(".tab"); if(b) setActiveTab(b.dataset.status); });
+$("#st").onchange = ()=> setActiveTab($("#st").value);
+$("#go").onclick  = load;
+$("#clr").onclick = ()=>{ $("#st").value="all"; $("#since").value=""; $("#lim").value=200; $("#q").value=""; setActiveTab("all"); load(); };
+$("#q").oninput   = ()=> render(cacheTickets);
 load();
 </script>
-</body></html>`);
+</body>
+</html>`);
 });
 
-// JSON that the HTML panel calls
-app.get("/admin/ui/tickets", requireUIPassword, async (req, res) => {
+// Admin UI JSON used by the panel (accept cookie OR Basic on first hit)
+app.get("/admin/ui/tickets", requireUIAuth, async (req, res) => {
   try {
     const { since, status = "all", limit = 200 } = req.query || {};
-    const tickets = await collectTickets({ since, status, limit });
-    res.json({ ok: true, count: tickets.length, tickets });
+    const tickets = await collectTickets({ since, status: normalizeStatus(status), limit });
+    res.json({ ok:true, count: tickets.length, tickets });
   } catch (e) {
     res.status(500).json({ ok:false, error:String(e.message||e) });
   }
 });
 
-app.post("/admin/ui/update", requireUIPassword, async (req, res) => {
+app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
   try {
-    const { order_id, ticket_id, status = "pending" } = req.body || {};
+    const { order_id, ticket_id } = req.body || {};
+    const status = normalizeStatus(req.body?.status || "pending");
     if (!order_id || !ticket_id) return res.status(400).json({ ok:false, error:"missing order_id/ticket_id" });
 
     const orderGid = `gid://shopify/Order/${order_id}`;
-    const q1 = `query GetOrder($id:ID!){ order(id:$id){ name metafield(namespace:"support", key:"tickets"){ value } } }`;
-    const d1 = await adminGraphQL(q1, { id: orderGid });
+    const d1 = await adminGraphQL(`query GetOrder($id:ID!){ order(id:$id){ name metafield(namespace:"support", key:"tickets"){ value } } }`, { id: orderGid });
 
     let map = {};
     const raw = d1?.order?.metafield?.value;
-    if (raw) { try { map = JSON.parse(raw); } catch(_){} }
+    if (raw) { try { map = JSON.parse(raw); } catch {} }
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
-    map[ticket_id] = {
-      ...(prev||{}),
-      ticket_id, status, order_id,
+    map[ticket_id] = { ...(prev||{}), ticket_id, status, order_id,
       order_name: prev.order_name || d1?.order?.name || "",
       created_at: prev.created_at || now,
-      updated_at: now
-    };
+      updated_at: now };
 
-    const q2 = `
+    const d2 = await adminGraphQL(`
       mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
-        metafieldsSet(metafields:[{
-          ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value
-        },{
-          ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid
-        },{
-          ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st
-        }]){ userErrors { field message } }
-      }`;
-    const d2 = await adminGraphQL(q2, {
-      ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: status
-    });
+        metafieldsSet(metafields:[
+          { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
+          { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
+          { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st }
+        ]){ userErrors { field message } }`,
+      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: status });
+
     const err = d2?.metafieldsSet?.userErrors?.[0];
     if (err) throw new Error(err.message);
 
@@ -617,6 +655,7 @@ app.post("/admin/ui/update", requireUIPassword, async (req, res) => {
   }
 });
 
+// ----------------------------------------------------------------------
 app.listen(PORT, () =>
   console.log(`[server] listening on :${PORT} mount=${PROXY_MOUNT} api=${API_VERSION}`)
-)
+);
