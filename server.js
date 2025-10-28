@@ -17,8 +17,14 @@ import rateLimit from "express-rate-limit";
 import cookieParser from "cookie-parser";
 import { fileURLToPath } from "url";
 
+// Polyfill fetch if running on a Node build without global fetch
+if (!globalThis.fetch) {
+  const { default: nodeFetch } = await import("node-fetch");
+  globalThis.fetch = nodeFetch;
+}
+
 const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.disable("x-powered-by");
@@ -26,10 +32,12 @@ app.set("trust proxy", true);
 
 // ---------- middleware
 // We disable global CSP and set a route-specific CSP with a nonce on /admin/panel
-app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginResourcePolicy: { policy: "same-site" }
-}));
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: "same-site" },
+  })
+);
 app.use(rateLimit({ windowMs: 60_000, max: 180 }));
 app.use(cookieParser());
 app.use(express.json({ limit: "512kb" }));
@@ -44,13 +52,14 @@ app.use(
 );
 
 // ---------- env
-const PORT         = process.env.PORT || 3000;
-const PROXY_MOUNT  = process.env.PROXY_MOUNT || "/tickets";
+const PORT = process.env.PORT || 3000;
+const PROXY_MOUNT = process.env.PROXY_MOUNT || "/tickets";
 const PROXY_SECRET = process.env.PROXY_SECRET || "";
-const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP || "";      // e.g. zuvic-in.myshopify.com
-const ADMIN_TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN || "";
-const API_VERSION  = process.env.SHOPIFY_API_VERSION || process.env.API_VERSION || "2024-10";
-const SKIP_VERIFY  = process.env.SKIP_PROXY_VERIFY === "1";
+const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP || ""; // e.g. zuvic-in.myshopify.com
+const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || "";
+const API_VERSION =
+  process.env.SHOPIFY_API_VERSION || process.env.API_VERSION || "2024-10";
+const SKIP_VERIFY = process.env.SKIP_PROXY_VERIFY === "1";
 
 // ---------- utils
 app.get("/healthz", (_req, res) => res.type("text").send("ok"));
@@ -58,17 +67,22 @@ app.get("/healthz", (_req, res) => res.type("text").send("ok"));
 function normalizeStatus(s) {
   const v = String(s || "").toLowerCase();
   if (v === "in progress" || v === "processing") return "in_progress";
-  if (["pending", "in_progress", "resolved", "closed", "all"].includes(v)) return v;
+  if (["pending", "in_progress", "resolved", "closed", "all"].includes(v))
+    return v;
   return "all";
 }
 
 // App Proxy signature helpers (HMAC over sorted query without "signature")
 function expectedHmacFromReq(req, secret) {
-  const rawQs = (req.originalUrl.split("?")[1] || "");
+  const rawQs = req.originalUrl.split("?")[1] || "";
   const usp = new URLSearchParams(rawQs);
   const pairs = [];
   for (const [k, v] of usp) if (k !== "signature") pairs.push([k, v]);
-  pairs.sort((a, b) => (a[0] === b[0] ? String(a[1]).localeCompare(String(b[1])) : a[0].localeCompare(b[0])));
+  pairs.sort((a, b) =>
+    a[0] === b[0]
+      ? String(a[1]).localeCompare(String(b[1]))
+      : a[0].localeCompare(b[0])
+  );
   const msg = pairs.map(([k, v]) => `${k}=${v}`).join("");
   return crypto.createHmac("sha256", secret).update(msg).digest("hex");
 }
@@ -84,6 +98,11 @@ function verifyProxySignature(req) {
 
 // Shopify Admin GraphQL helper
 async function adminGraphQL(query, variables = {}) {
+  if (!SHOPIFY_SHOP || !ADMIN_TOKEN) {
+    throw new Error(
+      "Missing SHOPIFY_SHOP or SHOPIFY_ADMIN_TOKEN environment variables"
+    );
+  }
   const url = `https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`;
   const r = await fetch(url, {
     method: "POST",
@@ -106,56 +125,75 @@ async function adminGraphQL(query, variables = {}) {
 // ======================================================================
 app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
   try {
-    if (!verifyProxySignature(req)) return res.status(401).json({ ok: false, error: "invalid_signature" });
+    if (!verifyProxySignature(req))
+      return res.status(401).json({ ok: false, error: "invalid_signature" });
 
     const {
-      order_id, ticket_id,
+      order_id,
+      ticket_id,
       status = "pending",
-      issue = "", message = "", phone = "", email = "", name = "",
-      order_name = "", created_at
+      issue = "",
+      message = "",
+      phone = "",
+      email = "",
+      name = "",
+      order_name = "",
+      created_at,
     } = req.body || {};
 
     if (!order_id || !ticket_id) {
-      return res.status(400).json({ ok: false, error: "missing_fields", fields: ["order_id", "ticket_id"] });
+      return res
+        .status(400)
+        .json({ ok: false, error: "missing_fields", fields: ["order_id", "ticket_id"] });
     }
 
     const st = normalizeStatus(status);
     const orderGid = `gid://shopify/Order/${String(order_id)}`;
 
-    const d1 = await adminGraphQL(`
+    const d1 = await adminGraphQL(
+      `
       query GetOrder($id: ID!) {
         order(id: $id) { id name tickets: metafield(namespace:"support", key:"tickets"){ id value } }
-      }`, { id: orderGid });
+      }`,
+      { id: orderGid }
+    );
 
     let map = {};
     const mf = d1?.order?.tickets;
-    if (mf?.value) { try { map = JSON.parse(mf.value); } catch { map = {}; } }
+    if (mf?.value) {
+      try {
+        map = JSON.parse(mf.value);
+      } catch {
+        map = {};
+      }
+    }
 
-    const now  = new Date().toISOString();
+    const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
     map[ticket_id] = {
       ticket_id,
       status: st,
-      issue:   issue   || prev.issue   || "",
+      issue: issue || prev.issue || "",
       message: message || prev.message || "",
-      phone:   phone   || prev.phone   || "",
-      email:   email   || prev.email   || "",
-      name:    name    || prev.name    || "",
+      phone: phone || prev.phone || "",
+      email: email || prev.email || "",
+      name: name || prev.name || "",
       order_id,
       order_name: order_name || d1?.order?.name || prev.order_name || "",
       created_at: prev.created_at || created_at || now,
       updated_at: now,
     };
 
-    const d2 = await adminGraphQL(`
+    const d2 = await adminGraphQL(
+      `
       mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
         metafieldsSet(metafields:[
           { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
           { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
           { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st }
         ]) { userErrors { field message } }
-      }`, // ← extra } here too
-      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: status }
+      }`,
+      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: st }
     );
 
     const err = d2?.metafieldsSet?.userErrors?.[0];
@@ -170,15 +208,17 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
 
 app.get(`${PROXY_MOUNT}/find-ticket`, async (req, res) => {
   try {
-    if (!verifyProxySignature(req)) return res.status(401).json({ ok:false, error:"invalid_signature" });
+    if (!verifyProxySignature(req))
+      return res.status(401).json({ ok: false, error: "invalid_signature" });
 
     const ticket_id = String(req.query.ticket_id || "").trim();
-    const order_id  = String(req.query.order_id  || "").trim();
-    if (!ticket_id) return res.status(400).json({ ok:false, error:"missing ticket_id" });
-    if (!order_id)  return res.status(400).json({ ok:false, error:"missing order_id" });
+    const order_id = String(req.query.order_id || "").trim();
+    if (!ticket_id) return res.status(400).json({ ok: false, error: "missing ticket_id" });
+    if (!order_id) return res.status(400).json({ ok: false, error: "missing order_id" });
 
     const orderGid = `gid://shopify/Order/${order_id}`;
-    const d = await adminGraphQL(`
+    const d = await adminGraphQL(
+      `
       query GetOrderForTicket($id: ID!) {
         order(id: $id) {
           id name createdAt
@@ -186,30 +226,44 @@ app.get(`${PROXY_MOUNT}/find-ticket`, async (req, res) => {
           tId:     metafield(namespace:"support", key:"ticket_id"){ value }
           tStatus: metafield(namespace:"support", key:"ticket_status"){ value }
         }
-      }`, { id: orderGid });
+      }`,
+      { id: orderGid }
+    );
 
     const order = d?.order;
-    if (!order) return res.json({ ok:false, error:"order_not_found" });
+    if (!order) return res.json({ ok: false, error: "order_not_found" });
 
-    let ticket=null, status=null;
+    let ticket = null;
+    let status = null;
 
     const json = order.tickets?.value;
-    if (json) try {
-      const map = JSON.parse(json);
-      if (map && map[ticket_id]) { ticket = map[ticket_id]; status = ticket.status || null; }
-    } catch {}
+    if (json)
+      try {
+        const map = JSON.parse(json);
+        if (map && map[ticket_id]) {
+          ticket = map[ticket_id];
+          status = ticket.status || null;
+        }
+      } catch {}
 
     if (!ticket && order.tId?.value === ticket_id) {
       ticket = { ticket_id, status: order.tStatus?.value || "pending" };
       status = ticket.status;
     }
 
-    if (!ticket) return res.json({ ok:false, error:"ticket_not_found" });
+    if (!ticket) return res.json({ ok: false, error: "ticket_not_found" });
 
-    res.json({ ok:true, ticket, status: status || "pending", order_id, order_name: order.name, order_created_at: order.createdAt });
+    res.json({
+      ok: true,
+      ticket,
+      status: status || "pending",
+      order_id,
+      order_name: order.name,
+      order_created_at: order.createdAt,
+    });
   } catch (e) {
     console.error("[find-ticket]", e);
-    res.status(500).json({ ok:false, error:String(e.message||e) });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
@@ -218,15 +272,21 @@ app.get(`${PROXY_MOUNT}/find-ticket`, async (req, res) => {
 // ======================================================================
 const ADMIN_UI_KEY = process.env.ADMIN_UI_KEY || "";
 function requireAdmin(req, res, next) {
-  const bearer = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
-  const xkey   = String(req.headers["x-admin-ui-key"] || "").trim();
-  if (ADMIN_UI_KEY && (bearer === ADMIN_UI_KEY || xkey === ADMIN_UI_KEY)) return next();
-  return res.status(401).json({ ok:false, error:"unauthorized" });
+  const bearer = String(req.headers.authorization || "")
+    .replace(/^Bearer\s+/i, "")
+    .trim();
+  const xkey = String(req.headers["x-admin-ui-key"] || "").trim();
+  if (ADMIN_UI_KEY && (bearer === ADMIN_UI_KEY || xkey === ADMIN_UI_KEY))
+    return next();
+  return res.status(401).json({ ok: false, error: "unauthorized" });
 }
-app.use((req,res,next)=>{
-  res.setHeader("Access-Control-Allow-Origin","*");
-  res.setHeader("Access-Control-Allow-Headers","Content-Type, Authorization, X-Admin-UI-Key");
-  res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Admin-UI-Key"
+  );
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -238,7 +298,8 @@ async function collectTickets({ since, status, limit = 200 }) {
   const shopQuery = since ? `updated_at:>=${since}` : null;
 
   while (out.length < max) {
-    const data = await adminGraphQL(`
+    const data = await adminGraphQL(
+      `
       query Orders($first:Int!,$after:String,$query:String){
         orders(first:$first, after:$after, query:$query, sortKey:UPDATED_AT, reverse:true){
           edges{
@@ -252,7 +313,9 @@ async function collectTickets({ since, status, limit = 200 }) {
           }
           pageInfo{ hasNextPage }
         }
-      }`, { first: 50, after, query: shopQuery });
+      }`,
+      { first: 50, after, query: shopQuery }
+    );
 
     const edges = data?.orders?.edges || [];
     if (!edges.length) break;
@@ -268,7 +331,11 @@ async function collectTickets({ since, status, limit = 200 }) {
 
       let map = {};
       const raw = node.mfJSON?.value;
-      if (raw) { try { map = JSON.parse(raw); } catch {} }
+      if (raw) {
+        try {
+          map = JSON.parse(raw);
+        } catch {}
+      }
 
       if (Object.keys(map).length) {
         for (const [key, t] of Object.entries(map)) {
@@ -280,7 +347,7 @@ async function collectTickets({ since, status, limit = 200 }) {
             message: t.message || "",
             phone: t.phone || "",
             email: t.email || "",
-            name:  t.name  || "",
+            name: t.name || "",
             created_at: t.created_at || base.order_created_at,
             updated_at: t.updated_at || base.order_updated_at,
           };
@@ -294,11 +361,16 @@ async function collectTickets({ since, status, limit = 200 }) {
           ...base,
           ticket_id: node.mfId.value,
           status: normalizeStatus(node.mfSt?.value || "pending"),
-          issue: "", message: "", phone: "", email: "", name: "",
+          issue: "",
+          message: "",
+          phone: "",
+          email: "",
+          name: "",
           created_at: base.order_created_at,
           updated_at: base.order_updated_at,
         };
-        if (!status || status === "all" || rec.status === normalizeStatus(status)) out.push(rec);
+        if (!status || status === "all" || rec.status === normalizeStatus(status))
+          out.push(rec);
       }
       if (out.length >= max) break;
       after = cursor;
@@ -312,11 +384,15 @@ async function collectTickets({ since, status, limit = 200 }) {
 app.get("/admin/tickets", requireAdmin, async (req, res) => {
   try {
     const { since, status, limit } = req.query || {};
-    const tickets = await collectTickets({ since, status: normalizeStatus(status), limit });
+    const tickets = await collectTickets({
+      since,
+      status: normalizeStatus(status),
+      limit,
+    });
     res.json({ ok: true, count: tickets.length, tickets });
   } catch (e) {
     console.error("GET /admin/tickets", e);
-    res.status(500).json({ ok:false, error:String(e.message||e) });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
@@ -324,73 +400,110 @@ app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
   try {
     const { order_id, ticket_id } = req.body || {};
     const status = normalizeStatus(req.body?.status || "pending");
-    if (!order_id || !ticket_id) return res.status(400).json({ ok:false, error:"missing order_id/ticket_id" });
+    if (!order_id || !ticket_id)
+      return res
+        .status(400)
+        .json({ ok: false, error: "missing order_id/ticket_id" });
 
     const orderGid = `gid://shopify/Order/${order_id}`;
-    const d1 = await adminGraphQL(`
+    const d1 = await adminGraphQL(
+      `
       query GetOrder($id:ID!){
         order(id:$id){ name metafield(namespace:"support", key:"tickets"){ value } }
-      }`, { id: orderGid });
+      }`,
+      { id: orderGid }
+    );
 
     let map = {};
     const raw = d1?.order?.metafield?.value;
-    if (raw) { try { map = JSON.parse(raw); } catch {} }
+    if (raw) {
+      try {
+        map = JSON.parse(raw);
+      } catch {}
+    }
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
     map[ticket_id] = {
       ...(prev || {}),
-      ticket_id, status, order_id,
+      ticket_id,
+      status,
+      order_id,
       order_name: prev.order_name || d1?.order?.name || "",
       created_at: prev.created_at || now,
       updated_at: now,
     };
 
-    const d2 = await adminGraphQL(`
+    const d2 = await adminGraphQL(
+      `
       mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
         metafieldsSet(metafields:[
           { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
           { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
           { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st }
-        ]){ userErrors { field message } }`,
-      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: status });
+        ]) { userErrors { field message } }
+      }`,
+      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: status }
+    );
 
     const err = d2?.metafieldsSet?.userErrors?.[0];
     if (err) throw new Error(err.message);
 
-    res.json({ ok:true, ticket: map[ticket_id] });
+    res.json({ ok: true, ticket: map[ticket_id] });
   } catch (e) {
     console.error("POST /admin/tickets/update", e);
-    res.status(500).json({ ok:false, error:String(e.message||e) });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
 // ======================================================================
 // Password-protected HTML Admin Panel (single-row tabs)
-// Basic on first load, then signed cookie; XHR accepts cookie or Basic.
 // ======================================================================
 const UI_USER = process.env.UI_USER || "admin";
 const UI_PASS = process.env.UI_PASS || "change-me";
-const UI_SESSION_SECRET = process.env.UI_SESSION_SECRET || ADMIN_UI_KEY || "change-me";
-function sign(s){ return crypto.createHmac("sha256", UI_SESSION_SECRET).update(s).digest("hex"); }
-function makeToken(hours=12){ const exp=Date.now()+hours*3600*1000; const p=String(exp); return `${p}.${sign(p)}`; }
-function verifyToken(t){ if(!t) return false; const [exp,sig]=String(t).split("."); return (sig===sign(exp)) && (+exp > Date.now()); }
-function isSecure(req){ return (req.headers["x-forwarded-proto"] || req.protocol) === "https"; }
+const UI_SESSION_SECRET =
+  process.env.UI_SESSION_SECRET || ADMIN_UI_KEY || "change-me";
+function sign(s) {
+  return crypto.createHmac("sha256", UI_SESSION_SECRET).update(s).digest("hex");
+}
+function makeToken(hours = 12) {
+  const exp = Date.now() + hours * 3600 * 1000;
+  const p = String(exp);
+  return `${p}.${sign(p)}`;
+}
+function verifyToken(t) {
+  if (!t) return false;
+  const [exp, sig] = String(t).split(".");
+  return sig === sign(exp) && +exp > Date.now();
+}
+function isSecure(req) {
+  return (req.headers["x-forwarded-proto"] || req.protocol) === "https";
+}
 
 // Basic helper used on first page load
 function requireUIPassword(req, res, next) {
-  res.set("Cache-Control", "no-store, must-revalidate"); res.set("Pragma","no-cache");
+  res.set("Cache-Control", "no-store, must-revalidate");
+  res.set("Pragma", "no-cache");
   const hdr = req.headers.authorization || "";
   if (!hdr.startsWith("Basic ")) {
-    res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"'); return res.status(401).send("Auth required");
+    res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"');
+    return res.status(401).send("Auth required");
   }
-  const [user, pass] = Buffer.from(hdr.split(" ")[1], "base64").toString("utf8").split(":");
+  const [user, pass] = Buffer.from(hdr.split(" ")[1], "base64")
+    .toString("utf8")
+    .split(":");
   if (user === UI_USER && pass === UI_PASS) {
     const token = makeToken(12);
-    res.cookie("ui_session", token, { httpOnly:true, sameSite:"Strict", secure:isSecure(req), path:"/admin" });
+    res.cookie("ui_session", token, {
+      httpOnly: true,
+      sameSite: "Strict",
+      secure: isSecure(req),
+      path: "/admin",
+    });
     return next();
   }
-  res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"'); return res.status(401).send("Auth required");
+  res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"');
+  return res.status(401).send("Auth required");
 }
 
 // Accept cookie OR Basic for XHR; if Basic is present, also set cookie.
@@ -400,10 +513,17 @@ function requireUIAuth(req, res, next) {
 
   const hdr = req.headers.authorization || "";
   if (hdr.startsWith("Basic ")) {
-    const [user, pass] = Buffer.from(hdr.split(" ")[1], "base64").toString("utf8").split(":");
+    const [user, pass] = Buffer.from(hdr.split(" ")[1], "base64")
+      .toString("utf8")
+      .split(":");
     if (user === UI_USER && pass === UI_PASS) {
       const token = makeToken(12);
-      res.cookie("ui_session", token, { httpOnly:true, sameSite:"Strict", secure:isSecure(req), path:"/admin" });
+      res.cookie("ui_session", token, {
+        httpOnly: true,
+        sameSite: "Strict",
+        secure: isSecure(req),
+        path: "/admin",
+      });
       return next();
     }
   }
@@ -411,8 +531,8 @@ function requireUIAuth(req, res, next) {
   return res.status(401).send("Auth required");
 }
 
-app.get("/admin/logout", (req,res)=>{
-  res.clearCookie("ui_session", { path:"/admin" });
+app.get("/admin/logout", (req, res) => {
+  res.clearCookie("ui_session", { path: "/admin" });
   res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"');
   res.status(401).send("Logged out");
 });
@@ -431,7 +551,9 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   );
 
   // Inline fallback UI (tabs in one line)
-  res.type("html").send(`<!doctype html>
+  res
+    .type("html")
+    .send(`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
@@ -540,7 +662,14 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
 <script nonce="${nonce}">
 const $  = (s)=>document.querySelector(s);
 const $$ = (s)=>document.querySelectorAll(s);
-const esc = (v)=> String(v ?? "").replace(/[&<>\"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',\"'\":'&#39;'}[ch]));
+const esc = (v) =>
+  String(v ?? "").replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  })[ch]);
 const fmt = (d)=> d ? new Date(d).toLocaleString() : "—";
 const show = (msg)=>{ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); };
 const pill = (s)=> '<span class="pill">'+esc(String(s||"").replace("_"," "))+'</span>';
@@ -640,10 +769,14 @@ load();
 app.get("/admin/ui/tickets", requireUIAuth, async (req, res) => {
   try {
     const { since, status = "all", limit = 200 } = req.query || {};
-    const tickets = await collectTickets({ since, status: normalizeStatus(status), limit });
-    res.json({ ok:true, count: tickets.length, tickets });
+    const tickets = await collectTickets({
+      since,
+      status: normalizeStatus(status),
+      limit,
+    });
+    res.json({ ok: true, count: tickets.length, tickets });
   } catch (e) {
-    res.status(500).json({ ok:false, error:String(e.message||e) });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
@@ -651,41 +784,61 @@ app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
   try {
     const { order_id, ticket_id } = req.body || {};
     const status = normalizeStatus(req.body?.status || "pending");
-    if (!order_id || !ticket_id) return res.status(400).json({ ok:false, error:"missing order_id/ticket_id" });
+    if (!order_id || !ticket_id)
+      return res
+        .status(400)
+        .json({ ok: false, error: "missing order_id/ticket_id" });
 
     const orderGid = `gid://shopify/Order/${order_id}`;
-    const d1 = await adminGraphQL(`query GetOrder($id:ID!){ order(id:$id){ name metafield(namespace:"support", key:"tickets"){ value } } }`, { id: orderGid });
+    const d1 = await adminGraphQL(
+      `query GetOrder($id:ID!){ order(id:$id){ name metafield(namespace:"support", key:"tickets"){ value } } }`,
+      { id: orderGid }
+    );
 
     let map = {};
     const raw = d1?.order?.metafield?.value;
-    if (raw) { try { map = JSON.parse(raw); } catch {} }
+    if (raw) {
+      try {
+        map = JSON.parse(raw);
+      } catch {}
+    }
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
-    map[ticket_id] = { ...(prev||{}), ticket_id, status, order_id,
+    map[ticket_id] = {
+      ...(prev || {}),
+      ticket_id,
+      status,
+      order_id,
       order_name: prev.order_name || d1?.order?.name || "",
       created_at: prev.created_at || now,
-      updated_at: now };
+      updated_at: now,
+    };
 
-    const d2 = await adminGraphQL(`
+    const d2 = await adminGraphQL(
+      `
       mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
         metafieldsSet(metafields:[
           { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
           { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
           { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st }
-        ]){ userErrors { field message } }`,
-      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: status });
+        ]) { userErrors { field message } }
+      }`,
+      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: status }
+    );
 
     const err = d2?.metafieldsSet?.userErrors?.[0];
     if (err) throw new Error(err.message);
 
-    res.json({ ok:true, ticket: map[ticket_id] });
+    res.json({ ok: true, ticket: map[ticket_id] });
   } catch (e) {
-    res.status(500).json({ ok:false, error:String(e.message||e) });
+    res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
 
 // ----------------------------------------------------------------------
 app.listen(PORT, () =>
-  console.log(`[server] listening on :${PORT} mount=${PROXY_MOUNT} api=${API_VERSION}`)
+  console.log(
+    `[server] listening on :${PORT} mount=${PROXY_MOUNT} api=${API_VERSION}`
+  )
 );
