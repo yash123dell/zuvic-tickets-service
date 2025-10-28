@@ -10,7 +10,6 @@
 import express from "express";
 import crypto from "crypto";
 import path from "path";
-import fs from "fs";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import cookieParser from "cookie-parser";
@@ -354,8 +353,8 @@ async function collectTickets({ since, status, limit = 200 }) {
       if (out.length >= max) break;
     }
 
-    after = edges[edges.length - 1].cursor;
-    if (!data.orders.pageInfo.hasNextPage) break;
+    after = edges[edges.length - 1]?.cursor || null;
+    if (!data?.orders?.pageInfo?.hasNextPage) break;
   }
 
   return out.slice(0, max);
@@ -431,7 +430,7 @@ app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
   }
 });
 
-// ===== Password-protected HTML admin panel =====
+// ===== Password-protected HTML admin panel (INLINE ONLY) =====
 const UI_USER = process.env.UI_USER || "admin";
 const UI_PASS = process.env.UI_PASS || "change-me";
 
@@ -457,10 +456,8 @@ app.get("/admin/logout", (_req, res) => {
   res.status(401).send("Logged out");
 });
 
-// Serve panel (inline fallback if /public/admin-panel.html is missing)
-app.get("/admin/panel", requireUIPassword, (req, res) => {
-  const panelPath = path.join(__dirname, "public", "admin-panel.html");
-  if (fs.existsSync(panelPath)) return res.sendFile(panelPath);
+// Always serve the inline panel (no public/admin-panel.html fallback)
+app.get("/admin/panel", requireUIPassword, (_req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="en">
 <head>
@@ -471,7 +468,6 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   :root{
     --bg:#f6f7fb; --fg:#0f172a; --muted:#64748b;
     --card:#fff; --border:#e5e7eb; --primary:#1d4ed8;
-    --ok:#16a34a; --warn:#f59e0b; --info:#3b82f6; --bad:#ef4444;
     --pill:#eef2ff; --pillfg:#3730a3;
   }
   *{box-sizing:border-box}
@@ -497,10 +493,8 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   .muted{color:var(--muted)}
   code{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:2px 6px}
   .row-actions{display:flex;gap:8px}
-  .status-ok{background:#dcfce7;color:#166534}
   .toast{position:fixed;right:16px;bottom:16px;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s}
   .toast.show{opacity:1;transform:translateY(0)}
-  .hl{background:#fff3cd}
 </style>
 </head>
 <body>
@@ -578,6 +572,7 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
 const $  = (s)=>document.querySelector(s);
 const $$ = (s)=>document.querySelectorAll(s);
 
+// FIXED: safe escaping (previous bug caused a JS parse error)
 function esc(v){
   const map = { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" };
   return String(v ?? "").replace(/[&<>"']/g, s => map[s]);
@@ -629,43 +624,52 @@ function filterRows(q, list){
 
 async function load(){
   $("#err").style.display="none";
-  const qs = new URLSearchParams({
-    status: $("#st").value || "all",
-    since:  $("#since").value || "",
-    limit:  $("#lim").value || 200
-  });
-  const r = await fetch("/admin/ui/tickets?"+qs.toString(), {credentials:"include"});
-  const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
-  if(!j.ok){ $("#err").textContent = "Failed: " + j.error; $("#err").style.display="block"; $("#tbl tbody").innerHTML=""; return; }
+  try{
+    const qs = new URLSearchParams({
+      status: $("#st").value || "all",
+      since:  $("#since").value || "",
+      limit:  $("#lim").value || 200
+    });
+    const r = await fetch("/admin/ui/tickets?"+qs.toString(), {credentials:"include"});
+    const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
+    if(!j.ok){
+      $("#err").textContent = "Failed: " + j.error;
+      $("#err").style.display="block";
+      $("#tbl tbody").innerHTML="";
+      return;
+    }
+    const rows = filterRows($("#q").value||"", j.tickets).map(row).join("");
+    $("#tbl tbody").innerHTML = rows || '<tr><td colspan="12" class="muted">No tickets</td></tr>';
 
-  const rows = filterRows($("#q").value||"", j.tickets).map(row).join("");
-  $("#tbl tbody").innerHTML = rows || '<tr><td colspan="12" class="muted">No tickets</td></tr>';
-
-  // wire Save / Copy
-  $$("#tbl .save").forEach(b => b.onclick = async (e)=>{
-    const tr = e.target.closest("tr");
-    const status = tr.querySelector(".set").value;
-    const body   = { order_id: tr.dataset.oid, ticket_id: tr.dataset.tid, status };
-    const r2 = await fetch("/admin/ui/update",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),credentials:"include"});
-    const j2 = await r2.json();
-    if(!j2.ok) alert("Update failed: " + j2.error);
-    else { show("Updated"); load(); }
-  });
-  $$("#tbl .copy").forEach(b => b.onclick = (e)=>{
-    const tr = e.target.closest("tr");
-    const data = {
-      ticket: tr.dataset.tid,
-      order:  tr.dataset.oid,
-      status: tr.querySelector(".set").value,
-      name:   tr.children[6].innerText,
-      email:  tr.children[7].innerText,
-      phone:  tr.children[8].innerText,
-      issue:  tr.children[9].innerText,
-      message: tr.children[10].innerText
-    };
-    navigator.clipboard.writeText(JSON.stringify(data, null, 2));
-    show("Copied");
-  });
+    // wire Save / Copy
+    $$("#tbl .save").forEach(b => b.onclick = async (e)=>{
+      const tr = e.target.closest("tr");
+      const status = tr.querySelector(".set").value;
+      const body   = { order_id: tr.dataset.oid, ticket_id: tr.dataset.tid, status };
+      const r2 = await fetch("/admin/ui/update",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),credentials:"include"});
+      const j2 = await r2.json();
+      if(!j2.ok) alert("Update failed: " + j2.error);
+      else { show("Updated"); load(); }
+    });
+    $$("#tbl .copy").forEach(b => b.onclick = (e)=>{
+      const tr = e.target.closest("tr");
+      const data = {
+        ticket: tr.dataset.tid,
+        order:  tr.dataset.oid,
+        status: tr.querySelector(".set").value,
+        name:   tr.children[6].innerText,
+        email:  tr.children[7].innerText,
+        phone:  tr.children[8].innerText,
+        issue:  tr.children[9].innerText,
+        message: tr.children[10].innerText
+      };
+      navigator.clipboard.writeText(JSON.stringify(data, null, 2));
+      show("Copied");
+    });
+  }catch(e){
+    $("#err").textContent = "Error: " + (e.message || e);
+    $("#err").style.display="block";
+  }
 }
 
 $("#go").onclick  = load;
