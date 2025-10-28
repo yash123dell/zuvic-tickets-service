@@ -4,9 +4,9 @@
 // - PROXY_MOUNT (default "/tickets")
 // - SHOPIFY_API_VERSION or API_VERSION (fallback "2024-10")
 // - ADMIN_UI_KEY           (Bearer for programmatic admin API)
-// - UI_USER, UI_PASS       (Basic auth for HTML admin panel)
-// - UI_SESSION_SECRET      (signing key for admin UI cookie; defaults to ADMIN_UI_KEY or "change-me")
-// Optional: SKIP_PROXY_VERIFY=1  (skip App Proxy signature verification for local dev)
+// - UI_USER, UI_PASS       (basic-credentials for first HTML load)
+// - UI_SESSION_SECRET      (signing key for cookie; defaults to ADMIN_UI_KEY or "change-me")
+// Optional: SKIP_PROXY_VERIFY=1
 
 import express from "express";
 import crypto from "crypto";
@@ -17,7 +17,7 @@ import rateLimit from "express-rate-limit";
 import cookieParser from "cookie-parser";
 import { fileURLToPath } from "url";
 
-// Polyfill fetch if needed
+// Polyfill fetch if running on a Node build without global fetch
 if (!globalThis.fetch) {
   const { default: nodeFetch } = await import("node-fetch");
   globalThis.fetch = nodeFetch;
@@ -66,12 +66,11 @@ app.get("/healthz", (_req, res) => res.type("text").send("ok"));
 function normalizeStatus(s) {
   const v = String(s || "").toLowerCase();
   if (v === "in progress" || v === "processing") return "in_progress";
-  if (["pending", "in_progress", "resolved", "closed", "all"].includes(v))
-    return v;
+  if (["pending", "in_progress", "resolved", "closed", "all"].includes(v)) return v;
   return "all";
 }
 
-// App Proxy signature helpers (HMAC over sorted query without "signature")
+// App Proxy signature helpers
 function expectedHmacFromReq(req, secret) {
   const rawQs = req.originalUrl.split("?")[1] || "";
   const usp = new URLSearchParams(rawQs);
@@ -98,9 +97,7 @@ function verifyProxySignature(req) {
 // Shopify Admin GraphQL helper
 async function adminGraphQL(query, variables = {}) {
   if (!SHOPIFY_SHOP || !ADMIN_TOKEN) {
-    throw new Error(
-      "Missing SHOPIFY_SHOP or SHOPIFY_ADMIN_TOKEN environment variables"
-    );
+    throw new Error("Missing SHOPIFY_SHOP or SHOPIFY_ADMIN_TOKEN");
   }
   const url = `https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`;
   const r = await fetch(url, {
@@ -120,7 +117,7 @@ async function adminGraphQL(query, variables = {}) {
 }
 
 // ======================================================================
-// App Proxy endpoints (used from your storefront app proxy)
+// App Proxy endpoints (storefront)
 // ======================================================================
 app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
   try {
@@ -150,21 +147,14 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
     const orderGid = `gid://shopify/Order/${String(order_id)}`;
 
     const d1 = await adminGraphQL(
-      `
-      query GetOrder($id: ID!) {
-        order(id: $id) { id name tickets: metafield(namespace:"support", key:"tickets"){ id value } }
-      }`,
+      `query GetOrder($id: ID!) { order(id: $id) { id name tickets: metafield(namespace:"support", key:"tickets"){ id value } } }`,
       { id: orderGid }
     );
 
     let map = {};
     const mf = d1?.order?.tickets;
     if (mf?.value) {
-      try {
-        map = JSON.parse(mf.value);
-      } catch {
-        map = {};
-      }
+      try { map = JSON.parse(mf.value); } catch { map = {}; }
     }
 
     const now = new Date().toISOString();
@@ -184,15 +174,14 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
     };
 
     const d2 = await adminGraphQL(
-      `
-      mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
+      `mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
         metafieldsSet(metafields:[
           { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
           { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
           { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st }
         ]) { userErrors { field message } }
       }`,
-      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: st }
+      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st }
     );
 
     const err = d2?.metafieldsSet?.userErrors?.[0];
@@ -217,8 +206,7 @@ app.get(`${PROXY_MOUNT}/find-ticket`, async (req, res) => {
 
     const orderGid = `gid://shopify/Order/${order_id}`;
     const d = await adminGraphQL(
-      `
-      query GetOrderForTicket($id: ID!) {
+      `query GetOrderForTicket($id: ID!) {
         order(id: $id) {
           id name createdAt
           tickets: metafield(namespace:"support", key:"tickets"){ value }
@@ -232,18 +220,13 @@ app.get(`${PROXY_MOUNT}/find-ticket`, async (req, res) => {
     const order = d?.order;
     if (!order) return res.json({ ok: false, error: "order_not_found" });
 
-    let ticket = null;
-    let status = null;
+    let ticket = null, status = null;
 
     const json = order.tickets?.value;
-    if (json)
-      try {
-        const map = JSON.parse(json);
-        if (map && map[ticket_id]) {
-          ticket = map[ticket_id];
-          status = ticket.status || null;
-        }
-      } catch {}
+    if (json) try {
+      const map = JSON.parse(json);
+      if (map && map[ticket_id]) { ticket = map[ticket_id]; status = ticket.status || null; }
+    } catch {}
 
     if (!ticket && order.tId?.value === ticket_id) {
       ticket = { ticket_id, status: order.tStatus?.value || "pending" };
@@ -267,7 +250,7 @@ app.get(`${PROXY_MOUNT}/find-ticket`, async (req, res) => {
 });
 
 // ======================================================================
-// Admin (Bearer) API — programmatic
+// Admin (programmatic) API
 // ======================================================================
 const ADMIN_UI_KEY = process.env.ADMIN_UI_KEY || "";
 function requireAdmin(req, res, next) {
@@ -275,16 +258,12 @@ function requireAdmin(req, res, next) {
     .replace(/^Bearer\s+/i, "")
     .trim();
   const xkey = String(req.headers["x-admin-ui-key"] || "").trim();
-  if (ADMIN_UI_KEY && (bearer === ADMIN_UI_KEY || xkey === ADMIN_UI_KEY))
-    return next();
+  if (ADMIN_UI_KEY && (bearer === ADMIN_UI_KEY || xkey === ADMIN_UI_KEY)) return next();
   return res.status(401).json({ ok: false, error: "unauthorized" });
 }
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Admin-UI-Key"
-  );
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-UI-Key");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -298,8 +277,7 @@ async function collectTickets({ since, status, limit = 200 }) {
 
   while (out.length < max) {
     const data = await adminGraphQL(
-      `
-      query Orders($first:Int!,$after:String,$query:String){
+      `query Orders($first:Int!,$after:String,$query:String){
         orders(first:$first, after:$after, query:$query, sortKey:UPDATED_AT, reverse:true){
           edges{
             cursor
@@ -330,11 +308,7 @@ async function collectTickets({ since, status, limit = 200 }) {
 
       let map = {};
       const raw = node.mfJSON?.value;
-      if (raw) {
-        try {
-          map = JSON.parse(raw);
-        } catch {}
-      }
+      if (raw) { try { map = JSON.parse(raw); } catch {} }
 
       if (Object.keys(map).length) {
         for (const [key, t] of Object.entries(map)) {
@@ -368,8 +342,7 @@ async function collectTickets({ since, status, limit = 200 }) {
           created_at: base.order_created_at,
           updated_at: base.order_updated_at,
         };
-        if (!status || status === "all" || rec.status === normalizeStatus(status))
-          out.push(rec);
+        if (!status || status === "all" || rec.status === normalizeStatus(status)) out.push(rec);
       }
       if (out.length >= max) break;
       after = cursor;
@@ -400,26 +373,17 @@ app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
     const { order_id, ticket_id } = req.body || {};
     const status = normalizeStatus(req.body?.status || "pending");
     if (!order_id || !ticket_id)
-      return res
-        .status(400)
-        .json({ ok: false, error: "missing order_id/ticket_id" });
+      return res.status(400).json({ ok: false, error: "missing order_id/ticket_id" });
 
     const orderGid = `gid://shopify/Order/${order_id}`;
     const d1 = await adminGraphQL(
-      `
-      query GetOrder($id:ID!){
-        order(id:$id){ name metafield(namespace:"support", key:"tickets"){ value } }
-      }`,
+      `query GetOrder($id:ID!){ order(id:$id){ name metafield(namespace:"support", key:"tickets"){ value } } }`,
       { id: orderGid }
     );
 
     let map = {};
     const raw = d1?.order?.metafield?.value;
-    if (raw) {
-      try {
-        map = JSON.parse(raw);
-      } catch {}
-    }
+    if (raw) { try { map = JSON.parse(raw); } catch {} }
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
@@ -434,8 +398,7 @@ app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
     };
 
     const d2 = await adminGraphQL(
-      `
-      mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
+      `mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
         metafieldsSet(metafields:[
           { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
           { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
@@ -456,73 +419,47 @@ app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
 });
 
 // ======================================================================
-// Password-protected HTML Admin Panel (white UI, no horizontal scroll)
+// Admin Panel (Basic on first load → signed cookie; single-row tabs)
 // ======================================================================
 const UI_USER = process.env.UI_USER || "admin";
 const UI_PASS = process.env.UI_PASS || "change-me";
 const UI_SESSION_SECRET =
   process.env.UI_SESSION_SECRET || ADMIN_UI_KEY || "change-me";
-function sign(s) {
-  return crypto.createHmac("sha256", UI_SESSION_SECRET).update(s).digest("hex");
-}
-function makeToken(hours = 12) {
-  const exp = Date.now() + hours * 3600 * 1000;
-  const p = String(exp);
-  return `${p}.${sign(p)}`;
-}
-function verifyToken(t) {
-  if (!t) return false;
-  const [exp, sig] = String(t).split(".");
-  return sig === sign(exp) && +exp > Date.now();
-}
-function isSecure(req) {
-  return (req.headers["x-forwarded-proto"] || req.protocol) === "https";
-}
+function sign(s) { return crypto.createHmac("sha256", UI_SESSION_SECRET).update(s).digest("hex"); }
+function makeToken(hours = 12) { const exp = Date.now() + hours * 3600 * 1000; const p = String(exp); return `${p}.${sign(p)}`; }
+function verifyToken(t){ if(!t) return false; const [exp,sig]=String(t).split("."); return (sig===sign(exp)) && (+exp > Date.now()); }
+function isSecure(req){ return (req.headers["x-forwarded-proto"] || req.protocol) === "https"; }
 
-// Basic helper used on first page load
+// First load requires Basic, then we drop a cookie, so no popup afterwards
 function requireUIPassword(req, res, next) {
   res.set("Cache-Control", "no-store, must-revalidate");
-  res.set("Pragma", "no-cache");
+  res.set("Pragma","no-cache");
   const hdr = req.headers.authorization || "";
   if (!hdr.startsWith("Basic ")) {
     res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"');
     return res.status(401).send("Auth required");
   }
-  const [user, pass] = Buffer.from(hdr.split(" ")[1], "base64")
-    .toString("utf8")
-    .split(":");
+  const [user, pass] = Buffer.from(hdr.split(" ")[1], "base64").toString("utf8").split(":");
   if (user === UI_USER && pass === UI_PASS) {
     const token = makeToken(12);
-    res.cookie("ui_session", token, {
-      httpOnly: true,
-      sameSite: "Strict",
-      secure: isSecure(req),
-      path: "/admin",
-    });
+    res.cookie("ui_session", token, { httpOnly:true, sameSite:"Strict", secure:isSecure(req), path:"/admin" });
     return next();
   }
   res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"');
   return res.status(401).send("Auth required");
 }
 
-// Accept cookie OR Basic for XHR; if Basic is present, also set cookie.
+// Cookie OR Basic for XHR
 function requireUIAuth(req, res, next) {
   const tok = req.cookies?.ui_session;
   if (tok && verifyToken(tok)) return next();
 
   const hdr = req.headers.authorization || "";
   if (hdr.startsWith("Basic ")) {
-    const [user, pass] = Buffer.from(hdr.split(" ")[1], "base64")
-      .toString("utf8")
-      .split(":");
+    const [user, pass] = Buffer.from(hdr.split(" ")[1], "base64").toString("utf8").split(":");
     if (user === UI_USER && pass === UI_PASS) {
       const token = makeToken(12);
-      res.cookie("ui_session", token, {
-        httpOnly: true,
-        sameSite: "Strict",
-        secure: isSecure(req),
-        path: "/admin",
-      });
+      res.cookie("ui_session", token, { httpOnly:true, sameSite:"Strict", secure:isSecure(req), path:"/admin" });
       return next();
     }
   }
@@ -536,7 +473,6 @@ app.get("/admin/logout", (req, res) => {
   res.status(401).send("Logged out");
 });
 
-// /admin/panel (white, no horizontal scroll, better actions, modal on ticket click)
 app.get("/admin/panel", requireUIPassword, (req, res) => {
   const panelPath = path.join(__dirname, "public", "admin-panel.html");
   if (fs.existsSync(panelPath)) return res.sendFile(panelPath);
@@ -547,6 +483,7 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
     `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'self'; frame-ancestors 'none'`
   );
 
+  // White UI + fixed table + dividers + proper Actions column + modal
   res.type("html").send(`<!doctype html>
 <html lang="en">
 <head>
@@ -555,65 +492,84 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
 <title>ZUVIC • Support tickets</title>
 <style>
   :root{
-    --bg:#ffffff; --fg:#0f172a; --muted:#64748b; --card:#ffffff; --border:#e5e7eb; --primary:#1d4ed8;
-    --tab:#eef2ff; --tabfg:#3730a3; --row:#ffffff; --divider:#f1f5f9; --pill:#eef2ff; --pillfg:#1e3a8a;
+    --bg:#ffffff; --fg:#0f172a; --muted:#64748b; --card:#fff; --border:#e5e7eb; --border-strong:#d1d5db;
+    --primary:#1d4ed8; --chip:#eef2ff; --chipfg:#3730a3; --row:#fafafa;
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
-  a{color:var(--primary);text-decoration:none}
-
   .wrap{padding:24px;max-width:1400px;margin:0 auto}
   .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
   .title{font-size:28px;font-weight:700}
-  .logout{color:var(--primary)}
-
+  .logout{color:var(--primary);text-decoration:none}
   .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px}
 
-  /* Tabs single-row */
+  /* Tabs one line */
   .tabs{display:flex;gap:8px;flex-wrap:nowrap;overflow:auto;white-space:nowrap;margin-bottom:12px}
   .tab{padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:#fff;color:#111;cursor:pointer}
   .tab.active{background:var(--primary);border-color:var(--primary);color:#fff}
-  .count{opacity:.85;margin-left:6px}
+  .tab .count{opacity:.85;margin-left:6px}
 
   /* Filters */
-  .filters{display:grid;grid-template-columns:180px 180px 120px 1fr auto auto;gap:10px;margin-bottom:10px;align-items:end}
-  label{font-size:12px;color:var(--muted);display:block}
+  .filters{display:grid;grid-template-columns:180px 180px 120px 1fr auto auto;gap:10px;margin-bottom:10px}
+  label{font-size:12px;color:var(--muted)}
   select,input,button{width:100%;height:36px;border:1px solid var(--border);border-radius:8px;padding:0 10px;background:#fff;color:var(--fg)}
   button{border-color:var(--primary);background:var(--primary);color:#fff;cursor:pointer}
-  .ghost{background:#fff;color:#111;border-color:var(--border)}
+  button.ghost{background:#fff;color:#111}
 
-  /* Table (no horizontal scroll) */
-  .table-wrap{border-radius:12px;border:1px solid var(--border);background:#fff}
-  table{width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0}
-  thead th{position:sticky;top:0;background:#fff;border-bottom:1px solid var(--border);font-weight:600;color:#334155;padding:12px}
-  tbody td{padding:12px;border-bottom:1px solid var(--divider);vertical-align:middle}
-  tbody tr:last-child td{border-bottom:0}
-  td,th{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* Table — no horizontal scroll, fixed layout, dividers */
+  .table-wrap{border:1px solid var(--border);border-radius:12px;background:#fff}
+  table{width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed}
+  th,td{padding:14px 16px;vertical-align:middle;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  thead th{background:#fff;border-bottom:2px solid var(--border-strong);font-weight:700;color:#334155}
+  tbody tr{background:#fff}
+  tbody tr:nth-child(even){background:#fcfcff}
+  /* vertical dividers */
+  th:not(:last-child), td:not(:last-child){border-right:1px solid var(--border)}
+  /* horizontal row divider */
+  tbody td{border-bottom:1px solid var(--border)}
+  /* nice first & last rounding */
+  thead th:first-child{border-top-left-radius:12px}
+  thead th:last-child{border-top-right-radius:12px}
+  tbody tr:last-child td:first-child{border-bottom-left-radius:12px}
+  tbody tr:last-child td:last-child{border-bottom-right-radius:12px}
+
+  .pill{display:inline-block;padding:4px 10px;border-radius:999px;background:var(--chip);color:var(--chipfg);font-size:12px}
   .muted{color:var(--muted)}
-  .ord{font-weight:600}
-  .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--pill);color:var(--pillfg);font-size:12px}
-  .link{appearance:none;background:none;border:0;padding:0;color:var(--primary);cursor:pointer;font-weight:600}
+  .orderCell a{font-weight:700;text-decoration:none;color:#0f172a}
+  .orderId{margin-top:4px;font-size:12px;color:var(--muted)}
 
-  /* Actions cell */
-  .actions{display:flex;gap:8px;justify-content:flex-end;align-items:center}
-  .actions select{min-width:130px}
-  .actions button{min-width:76px}
+  /* Actions column */
+  th.actions, td.actions{width:260px}
+  td.actions{padding-right:18px}
+  .actionsRow{display:flex;align-items:center;gap:12px;justify-content:flex-end}
+  .actionsRow select{min-width:150px;height:40px;border-radius:10px}
+  .actionsRow .save{min-width:92px;height:40px;border-radius:10px;background:var(--primary);color:#fff;border:0}
 
-  /* Modal */
-  .overlay{position:fixed;inset:0;background:rgba(15,23,42,.35);display:none;align-items:center;justify-content:center;padding:16px}
-  .overlay.show{display:flex}
-  .modal{width:min(720px,96vw);background:#fff;border-radius:16px;border:1px solid var(--border);box-shadow:0 20px 60px rgba(0,0,0,.15);overflow:hidden}
-  .m-head{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
-  .m-title{font-size:18px;font-weight:700}
-  .m-body{padding:16px;display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  .m-row{display:flex;flex-direction:column}
-  .m-row label{font-size:12px;color:var(--muted);margin-bottom:6px}
-  .m-row input,.m-row textarea,.m-row select{height:38px;border:1px solid var(--border);border-radius:8px;padding:0 10px}
-  .m-row textarea{height:88px;padding:10px;resize:vertical}
-  .m-foot{padding:14px 16px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:10px}
-  .close{appearance:none;background:none;border:0;font-size:22px;line-height:22px;cursor:pointer;color:#334155}
+  /* Ticket link */
+  .tkt{color:#1d4ed8;text-decoration:none;font-weight:600}
+
+  /* Clip long text cells to one line */
+  .clip{max-width:260px}
+
+  /* Toast */
   .toast{position:fixed;right:16px;bottom:16px;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s}
   .toast.show{opacity:1;transform:translateY(0)}
+
+  /* Modal */
+  .backdrop{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;z-index:50}
+  .backdrop.show{display:flex}
+  .modal{width:min(980px,92vw);background:#fff;border:1px solid var(--border);border-radius:18px;box-shadow:0 25px 80px rgba(0,0,0,.25)}
+  .m-hd{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid var(--border)}
+  .m-tt{font-size:20px;font-weight:800}
+  .m-x{border:0;background:transparent;font-size:20px;cursor:pointer}
+  .m-bd{padding:20px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .fld label{display:block;font-size:12px;color:var(--muted);margin:0 0 6px 2px}
+  .fld input,.fld select,.fld textarea{width:100%;height:42px;border:1px solid var(--border);border-radius:10px;padding:0 12px;background:#fff}
+  .fld textarea{height:120px;resize:vertical;padding:10px 12px}
+  .m-ft{display:flex;gap:12px;justify-content:space-between;padding:16px 20px;border-top:1px solid var(--border)}
+  .btn{height:44px;border-radius:10px;padding:0 16px;border:1px solid var(--border);background:#fff}
+  .btn.primary{background:var(--primary);color:#fff;border:0}
 </style>
 </head>
 <body>
@@ -635,7 +591,7 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
     <div class="filters">
       <label>Status
         <select id="st">
-          <option value="all">All</option>
+          <option value="all">all</option>
           <option value="pending">pending</option>
           <option value="in_progress">in_progress</option>
           <option value="resolved">resolved</option>
@@ -658,199 +614,180 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
     <div id="err" class="muted" style="display:none"></div>
 
     <div class="table-wrap">
-      <table id="tbl" aria-label="Tickets table">
+      <table id="tbl">
         <thead>
           <tr>
-            <th>Order</th>
-            <th>Ticket</th>
-            <th>Status</th>
-            <th>Issue</th>
-            <th>Customer</th>
-            <th>Created</th>
-            <th>Updated</th>
-            <th>Actions</th>
+            <th style="width:240px">Order</th>
+            <th style="width:220px">Ticket</th>
+            <th style="width:150px">Status</th>
+            <th style="width:220px">Issue</th>
+            <th style="width:160px">Customer</th>
+            <th style="width:170px">Created</th>
+            <th style="width:170px">Updated</th>
+            <th class="actions">Actions</th>
           </tr>
         </thead>
-        <tbody><tr><td colspan="8" class="muted" style="padding:16px">Loading…</td></tr></tbody>
+        <tbody><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
       </table>
-    </div>
-  </div>
-</div>
-
-<!-- Modal -->
-<div id="dlg" class="overlay" role="dialog" aria-modal="true" aria-labelledby="dlg_title">
-  <div class="modal">
-    <div class="m-head">
-      <div id="dlg_title" class="m-title">Ticket</div>
-      <button class="close" aria-label="Close dialog">&times;</button>
-    </div>
-    <div class="m-body">
-      <div class="m-row"><label>Ticket ID</label><input id="d_tid" readonly/></div>
-      <div class="m-row"><label>Order</label><input id="d_order" readonly/></div>
-      <div class="m-row"><label>Status</label>
-        <select id="d_status">
-          <option value="pending">pending</option>
-          <option value="in_progress">in_progress</option>
-          <option value="resolved">resolved</option>
-          <option value="closed">closed</option>
-        </select>
-      </div>
-      <div class="m-row"><label>Issue</label><input id="d_issue" readonly/></div>
-      <div class="m-row"><label>Name</label><input id="d_name" readonly/></div>
-      <div class="m-row"><label>Email</label><input id="d_email" readonly/></div>
-      <div class="m-row"><label>Phone</label><input id="d_phone" readonly/></div>
-      <div class="m-row"><label>Message</label><textarea id="d_message" readonly></textarea></div>
-      <div class="m-row"><label>Created</label><input id="d_created" readonly/></div>
-      <div class="m-row"><label>Updated</label><input id="d_updated" readonly/></div>
-    </div>
-    <div class="m-foot">
-      <button id="d_save">Save</button>
-      <button class="ghost" id="d_close">Close</button>
     </div>
   </div>
 </div>
 
 <div id="toast" class="toast"></div>
 
+<!-- Modal -->
+<div id="backdrop" class="backdrop">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mTitle">
+    <div class="m-hd">
+      <div id="mTitle" class="m-tt">Ticket</div>
+      <button class="m-x" id="mClose" aria-label="Close">×</button>
+    </div>
+    <div class="m-bd">
+      <div class="grid2">
+        <div class="fld"><label>Ticket ID</label><input id="m_tid" readonly></div>
+        <div class="fld"><label>Order</label><input id="m_order" readonly></div>
+        <div class="fld"><label>Status</label>
+          <select id="m_status">
+            <option value="pending">pending</option>
+            <option value="in_progress">in_progress</option>
+            <option value="resolved">resolved</option>
+            <option value="closed">closed</option>
+          </select>
+        </div>
+        <div class="fld"><label>Issue</label><input id="m_issue" readonly></div>
+        <div class="fld"><label>Name</label><input id="m_name" readonly></div>
+        <div class="fld"><label>Email</label><input id="m_email" readonly></div>
+        <div class="fld"><label>Phone</label><input id="m_phone" readonly></div>
+        <div class="fld"><label>Message</label><textarea id="m_message" readonly></textarea></div>
+        <div class="fld"><label>Created</label><input id="m_created" readonly></div>
+        <div class="fld"><label>Updated</label><input id="m_updated" readonly></div>
+      </div>
+    </div>
+    <div class="m-ft">
+      <button class="btn primary" id="mSave">Save</button>
+      <button class="btn" id="mClose2">Close</button>
+    </div>
+  </div>
+</div>
+
 <script nonce="${nonce}">
 const $  = (s)=>document.querySelector(s);
 const $$ = (s)=>document.querySelectorAll(s);
-const esc = (v)=> String(v ?? "").replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+const esc = (v)=> String(v ?? "").replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\\'':'&#39;'}[ch]));
 const fmt = (d)=> d ? new Date(d).toLocaleString() : "—";
 const show = (msg)=>{ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); };
-const pill = (s)=> '<span class="pill">'+esc(String(s||"").replace("_"," "))+'</span>';
-const cell = (v)=> v ? esc(v) : "—";
 
-let currentStatus = "all";
-let cacheTickets  = [];
+let currentStatus="all", cacheTickets=[], currentRow=null;
 
 function setActiveTab(status){
-  currentStatus = status;
-  $$("#tabs .tab").forEach(btn => btn.classList.toggle("active", btn.dataset.status===status));
-  $("#st").value = status;
-  render(cacheTickets);
+  currentStatus=status;
+  $$("#tabs .tab").forEach(b=>b.classList.toggle("active", b.dataset.status===status));
+  $("#st").value=status; render(cacheTickets);
 }
 function counts(list){
-  const c = { all:list.length, pending:0, in_progress:0, resolved:0, closed:0 };
-  list.forEach(t => { const s=(t.status||"pending").toLowerCase(); if (c[s]!==undefined) c[s]++; });
-  $("#c_all").textContent = c.all;
-  $("#c_pending").textContent = c.pending;
-  $("#c_in_progress").textContent = c.in_progress;
-  $("#c_resolved").textContent = c.resolved;
-  $("#c_closed").textContent = c.closed;
+  const c={all:list.length,pending:0,in_progress:0,resolved:0,closed:0};
+  list.forEach(t=>{const s=(t.status||"pending").toLowerCase(); if(c[s]!=null) c[s]++;});
+  $("#c_all").textContent=c.all; $("#c_pending").textContent=c.pending; $("#c_in_progress").textContent=c.in_progress; $("#c_resolved").textContent=c.resolved; $("#c_closed").textContent=c.closed;
 }
-
 function orderCell(t){
-  const ord = esc(t.order_name || "");
-  const id  = esc(t.order_id || "");
-  return '<div class="ord">'+ord+'</div><div class="muted">ID: '+id+'</div>';
+  const no = esc(t.order_name||"");
+  const id = String(t.order_id||"");
+  return \`<div class="orderCell">
+    <a href="#" data-oid="\${id}" class="ord">\${no}</a>
+    <div class="orderId muted">ID: \${id||"—"}</div>
+  </div>\`;
 }
-
 function row(t){
-  // ticket link opens modal
-  const tlink = '<button class="link ticket" data-oid="'+esc(t.order_id)+'" data-tid="'+esc(t.ticket_id)+'"> '+esc(t.ticket_id)+' </button>';
-  return '<tr>'+
-    '<td>'+orderCell(t)+'</td>'+
-    '<td>'+tlink+'</td>'+
-    '<td>'+pill(t.status)+'</td>'+
-    '<td title="'+esc(t.issue||"")+'">'+cell(t.issue)+'</td>'+
-    '<td title="'+esc(t.name||"")+'">'+cell(t.name)+'</td>'+
-    '<td>'+fmt(t.created_at)+'</td>'+
-    '<td>'+fmt(t.updated_at)+'</td>'+
-    '<td><div class="actions">'+
-      '<select class="set">'+
-        '<option value="pending" '+(t.status==="pending"?"selected":"")+'>pending</option>'+
-        '<option value="in_progress" '+(t.status==="in_progress"?"selected":"")+'>in_progress</option>'+
-        '<option value="resolved" '+(t.status==="resolved"?"selected":"")+'>resolved</option>'+
-        '<option value="closed" '+(t.status==="closed"?"selected":"")+'>closed</option>'+
-      '</select>'+
-      '<button class="save" data-oid="'+esc(t.order_id)+'" data-tid="'+esc(t.ticket_id)+'">Save</button>'+
-    '</div></td>'+
-  '</tr>';
+  const clip = (v)=> \`<span class="clip" title="\${esc(v||"")}">\${esc(v||"")}</span>\`;
+  return \`<tr data-oid="\${t.order_id}" data-tid="\${esc(t.ticket_id)}">
+    <td>\${orderCell(t)}</td>
+    <td><a href="#" class="tkt" data-open="1">\${esc(t.ticket_id||"")}</a></td>
+    <td><span class="pill">\${esc(String(t.status||"").replace("_"," "))}</span></td>
+    <td>\${clip(t.issue)}</td>
+    <td>\${clip(t.name)}</td>
+    <td>\${fmt(t.created_at)}</td>
+    <td>\${fmt(t.updated_at)}</td>
+    <td class="actions"><div class="actionsRow">
+      <select class="set">
+        <option value="pending" \${t.status==="pending"?"selected":""}>pending</option>
+        <option value="in_progress" \${t.status==="in_progress"?"selected":""}>in_progress</option>
+        <option value="resolved" \${t.status==="resolved"?"selected":""}>resolved</option>
+        <option value="closed" \${t.status==="closed"?"selected":""}>closed</option>
+      </select>
+      <button class="save">Save</button>
+    </div></td>
+  </tr>\`;
 }
-
 function render(list){
   counts(list);
   const q = ($("#q").value||"").toLowerCase();
-  const rows = list.filter(t => {
+  const rows = list.filter(t=>{
     const byStatus = currentStatus==="all" ? true : (String(t.status).toLowerCase()===currentStatus);
-    if (!byStatus) return false;
-    if (!q) return true;
+    if(!byStatus) return false;
+    if(!q) return true;
     return [t.ticket_id,t.order_name,t.name,t.email].filter(Boolean).some(x=>String(x).toLowerCase().includes(q));
-  }).map(row).join("") || '<tr><td colspan="8" class="muted" style="padding:16px">No tickets</td></tr>';
+  }).map(row).join("") || '<tr><td colspan="8" class="muted">No tickets</td></tr>';
   $("#tbl tbody").innerHTML = rows;
 
-  // bind actions
-  $("#tbl").querySelectorAll(".save").forEach(btn=>{
-    btn.onclick = async ()=>{
-      const tr = btn.closest("tr");
-      const status = tr.querySelector(".set").value;
-      const body = { order_id: btn.dataset.oid, ticket_id: btn.dataset.tid, status };
-      const r2 = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
+  // Wire actions
+  $("#tbl tbody").querySelectorAll("button.save").forEach(btn=>{
+    btn.onclick = async (e)=>{
+      const tr = e.target.closest("tr");
+      const status = tr.querySelector("select.set").value;
+      const body = { order_id: tr.dataset.oid, ticket_id: tr.dataset.tid, status };
+      const r2 = await fetch("/admin/ui/update",{ method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
       const j2 = await r2.json().catch(()=>({ok:false,error:"bad_json"}));
       if(!j2.ok) alert("Update failed: " + j2.error);
       else { show("Updated"); load(); }
     };
   });
 
-  $("#tbl").querySelectorAll(".ticket").forEach(a=>{
-    a.onclick = ()=> openModal(a.dataset.oid, a.dataset.tid);
+  // Ticket click → modal
+  $("#tbl tbody").querySelectorAll('a.tkt').forEach(a=>{
+    a.onclick = (e)=>{ e.preventDefault(); openModal(e.target.closest("tr")); };
   });
 }
-
 async function load(){
   $("#err").style.display="none";
-  const qs = new URLSearchParams({
-    status: $("#st").value || "all",
-    since:  $("#since").value || "",
-    limit:  $("#lim").value  || 200
-  });
+  const qs = new URLSearchParams({ status: $("#st").value||"all", since: $("#since").value||"", limit: $("#lim").value||200 });
   const r = await fetch("/admin/ui/tickets?"+qs.toString(), { credentials:"include" });
   if (r.status === 401) { $("#err").textContent="Auth required. Reload the page."; $("#err").style.display="block"; return; }
   const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
   if(!j.ok && !Array.isArray(j.tickets)){ $("#err").textContent = "Failed: " + (j.error||"unexpected"); $("#err").style.display="block"; $("#tbl tbody").innerHTML=""; return; }
-  const list = Array.isArray(j.tickets) ? j.tickets : j; // accept either {tickets:[]} or [] shape
-  cacheTickets = list || [];
-  render(cacheTickets);
+  const list = Array.isArray(j.tickets) ? j.tickets : j;
+  cacheTickets = list || []; render(cacheTickets);
 }
 
-// ----- Modal helpers
-function fillModal(t){
-  $("#dlg_title").textContent = "Ticket • "+(t.ticket_id||"");
-  $("#d_tid").value = t.ticket_id||"";
-  $("#d_order").value = (t.order_name||"") + "   (ID: "+(t.order_id||"")+")";
-  $("#d_status").value = t.status||"pending";
-  $("#d_issue").value = t.issue||"";
-  $("#d_name").value = t.name||"";
-  $("#d_email").value = t.email||"";
-  $("#d_phone").value = t.phone||"";
-  $("#d_message").value = t.message||"";
-  $("#d_created").value = fmt(t.created_at);
-  $("#d_updated").value = fmt(t.updated_at);
-  $("#d_save").dataset.oid = t.order_id;
-  $("#d_save").dataset.tid = t.ticket_id;
+// Modal helpers
+function openModal(tr){
+  currentRow = tr;
+  const rec = cacheTickets.find(x=> String(x.order_id)===tr.dataset.oid && String(x.ticket_id)===tr.dataset.tid) || {};
+  $("#mTitle").textContent = "Ticket • " + (rec.ticket_id||"");
+  $("#m_tid").value   = rec.ticket_id||"";
+  $("#m_order").value = (rec.order_name||"") + (rec.order_id? "  (ID: "+rec.order_id+")" : "");
+  $("#m_status").value= rec.status||"pending";
+  $("#m_issue").value = rec.issue||"";
+  $("#m_name").value  = rec.name||"";
+  $("#m_email").value = rec.email||"";
+  $("#m_phone").value = rec.phone||"";
+  $("#m_message").value = rec.message||"";
+  $("#m_created").value= fmt(rec.created_at);
+  $("#m_updated").value= fmt(rec.updated_at);
+  $("#backdrop").classList.add("show");
 }
-function openModal(order_id, ticket_id){
-  const t = cacheTickets.find(x=> String(x.order_id)==String(order_id) && String(x.ticket_id)==String(ticket_id));
-  if(!t) return;
-  fillModal(t);
-  $("#dlg").classList.add("show");
-}
-function closeModal(){ $("#dlg").classList.remove("show"); }
+function closeModal(){ $("#backdrop").classList.remove("show"); }
 
-$("#d_close").onclick = closeModal;
-$(".close").onclick = closeModal;
-$("#dlg").addEventListener("click", (e)=>{ if(e.target.id==="dlg") closeModal(); });
-
-$("#d_save").onclick = async (e)=>{
-  const body = { order_id: e.target.dataset.oid, ticket_id: e.target.dataset.tid, status: $("#d_status").value };
-  const r = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
-  const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
-  if(!j.ok) alert("Update failed: " + j.error);
-  else { closeModal(); show("Updated"); load(); }
+$("#mClose").onclick = closeModal; $("#mClose2").onclick = closeModal;
+$("#mSave").onclick = async ()=>{
+  if(!currentRow) return;
+  const body = { order_id: currentRow.dataset.oid, ticket_id: currentRow.dataset.tid, status: $("#m_status").value };
+  const r2 = await fetch("/admin/ui/update",{ method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
+  const j2 = await r2.json().catch(()=>({ok:false,error:"bad_json"}));
+  if(!j2.ok) alert("Update failed: " + j2.error);
+  else { show("Updated"); closeModal(); load(); }
 };
 
-// bindings
+// Events
 $("#tabs").addEventListener("click",(e)=>{ const b=e.target.closest(".tab"); if(b) setActiveTab(b.dataset.status); });
 $("#st").onchange = ()=> setActiveTab($("#st").value);
 $("#go").onclick  = load;
@@ -863,29 +800,22 @@ load();
 </html>`);
 });
 
-// Admin UI JSON used by the panel (cookie OR Basic)
+// Admin UI JSON for panel
 app.get("/admin/ui/tickets", requireUIAuth, async (req, res) => {
   try {
     const { since, status = "all", limit = 200 } = req.query || {};
-    const tickets = await collectTickets({
-      since,
-      status: normalizeStatus(status),
-      limit,
-    });
+    const tickets = await collectTickets({ since, status: normalizeStatus(status), limit });
     res.json({ ok: true, count: tickets.length, tickets });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 });
-
 app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
   try {
     const { order_id, ticket_id } = req.body || {};
     const status = normalizeStatus(req.body?.status || "pending");
     if (!order_id || !ticket_id)
-      return res
-        .status(400)
-        .json({ ok: false, error: "missing order_id/ticket_id" });
+      return res.status(400).json({ ok: false, error: "missing order_id/ticket_id" });
 
     const orderGid = `gid://shopify/Order/${order_id}`;
     const d1 = await adminGraphQL(
@@ -895,27 +825,17 @@ app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
 
     let map = {};
     const raw = d1?.order?.metafield?.value;
-    if (raw) {
-      try {
-        map = JSON.parse(raw);
-      } catch {}
-    }
+    if (raw) { try { map = JSON.parse(raw); } catch {} }
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
-    map[ticket_id] = {
-      ...(prev || {}),
-      ticket_id,
-      status,
-      order_id,
+    map[ticket_id] = { ...(prev||{}), ticket_id, status, order_id,
       order_name: prev.order_name || d1?.order?.name || "",
       created_at: prev.created_at || now,
-      updated_at: now,
-    };
+      updated_at: now };
 
     const d2 = await adminGraphQL(
-      `
-      mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
+      `mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
         metafieldsSet(metafields:[
           { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
           { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
@@ -928,7 +848,7 @@ app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
     const err = d2?.metafieldsSet?.userErrors?.[0];
     if (err) throw new Error(err.message);
 
-    res.json({ ok: true, ticket: map[ticket_id] });
+    res.json({ ok:true, ticket: map[ticket_id] });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
@@ -936,7 +856,5 @@ app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
 
 // ----------------------------------------------------------------------
 app.listen(PORT, () =>
-  console.log(
-    `[server] listening on :${PORT} mount=${PROXY_MOUNT} api=${API_VERSION}`
-  )
+  console.log(`[server] listening on :${PORT} mount=${PROXY_MOUNT} api=${API_VERSION}`)
 );
