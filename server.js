@@ -15,10 +15,7 @@ import fs from "fs";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import cookieParser from "cookie-parser";
-import dotenv from "dotenv";
 import { fileURLToPath } from "url";
-
-dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
