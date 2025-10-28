@@ -473,17 +473,14 @@ app.get("/admin/logout", (req, res) => {
   res.status(401).send("Logged out");
 });
 
+// /admin/panel — full-width, no horizontal scroll, live updates + modal
 app.get("/admin/panel", requireUIPassword, (req, res) => {
-  const panelPath = path.join(__dirname, "public", "admin-panel.html");
-  if (fs.existsSync(panelPath)) return res.sendFile(panelPath);
-
   const nonce = crypto.randomBytes(16).toString("base64");
   res.setHeader(
     "Content-Security-Policy",
     `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'self'; frame-ancestors 'none'`
   );
 
-  // White UI + fixed table + dividers + proper Actions column + modal
   res.type("html").send(`<!doctype html>
 <html lang="en">
 <head>
@@ -492,102 +489,90 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
 <title>ZUVIC • Support tickets</title>
 <style>
   :root{
-    --bg:#ffffff; --fg:#0f172a; --muted:#64748b; --card:#fff; --border:#e5e7eb; --border-strong:#d1d5db;
-    --primary:#1d4ed8; --chip:#eef2ff; --chipfg:#3730a3; --row:#fafafa;
+    --bg:#ffffff; --fg:#0f172a; --muted:#64748b; --card:#fff;
+    --border:#e5e7eb; --primary:#1d4ed8; --primary-100:#e0e7ff;
+    --pill:#eef2ff; --pillfg:#3730a3;
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
-  .wrap{padding:24px;max-width:1400px;margin:0 auto}
+  a{color:#1d4ed8;text-decoration:none}
+  .wrap{padding:24px 24px 40px}
   .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
   .title{font-size:28px;font-weight:700}
-  .logout{color:var(--primary);text-decoration:none}
+  .logout{color:var(--primary)}
   .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px}
 
-  /* Tabs one line */
-  .tabs{display:flex;gap:8px;flex-wrap:nowrap;overflow:auto;white-space:nowrap;margin-bottom:12px}
-  .tab{padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:#fff;color:#111;cursor:pointer}
-  .tab.active{background:var(--primary);border-color:var(--primary);color:#fff}
-  .tab .count{opacity:.85;margin-left:6px}
+  /* Tabs row */
+  .tabs{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+  .chip{display:inline-flex;align-items:center;gap:8px;padding:10px 16px;border-radius:999px;border:1px solid var(--border);background:#fff;cursor:pointer}
+  .chip.active{background:var(--primary);border-color:var(--primary);color:#fff}
+  .chip .count{opacity:.9}
 
   /* Filters */
-  .filters{display:grid;grid-template-columns:180px 180px 120px 1fr auto auto;gap:10px;margin-bottom:10px}
-  label{font-size:12px;color:var(--muted)}
-  select,input,button{width:100%;height:36px;border:1px solid var(--border);border-radius:8px;padding:0 10px;background:#fff;color:var(--fg)}
-  button{border-color:var(--primary);background:var(--primary);color:#fff;cursor:pointer}
-  button.ghost{background:#fff;color:#111}
+  .filters{display:grid;grid-template-columns: 160px 180px 120px 1fr auto auto;gap:10px;margin-bottom:12px}
+  label{font-size:12px;color:var(--muted);display:grid;gap:6px}
+  select,input,button{height:36px;border:1px solid var(--border);border-radius:8px;background:#fff;color:var(--fg);padding:0 10px}
+  button.btn{border-color:var(--primary);background:var(--primary);color:#fff;cursor:pointer}
+  button.ghost{background:#fff}
 
-  /* Table — no horizontal scroll, fixed layout, dividers */
-  .table-wrap{border:1px solid var(--border);border-radius:12px;background:#fff}
+  /* Table (full width, no horizontal scroll) */
+  .table-wrap{border:1px solid var(--border);border-radius:12px;background:#fff;overflow:visible}
   table{width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed}
-  th,td{padding:14px 16px;vertical-align:middle;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  thead th{background:#fff;border-bottom:2px solid var(--border-strong);font-weight:700;color:#334155}
-  tbody tr{background:#fff}
-  tbody tr:nth-child(even){background:#fcfcff}
-  /* vertical dividers */
-  th:not(:last-child), td:not(:last-child){border-right:1px solid var(--border)}
-  /* horizontal row divider */
-  tbody td{border-bottom:1px solid var(--border)}
-  /* nice first & last rounding */
-  thead th:first-child{border-top-left-radius:12px}
-  thead th:last-child{border-top-right-radius:12px}
-  tbody tr:last-child td:first-child{border-bottom-left-radius:12px}
-  tbody tr:last-child td:last-child{border-bottom-right-radius:12px}
-
-  .pill{display:inline-block;padding:4px 10px;border-radius:999px;background:var(--chip);color:var(--chipfg);font-size:12px}
+  col.order   {width:16%}
+  col.ticket  {width:14%}
+  col.status  {width:12%}
+  col.issue   {width:14%}
+  col.customer{width:12%}
+  col.when    {width:12%}
+  col.when2   {width:12%}
+  col.actions {width:8%}
+  thead th{position:sticky;top:0;background:#fafafa;z-index:2}
+  th,td{padding:12px 14px;vertical-align:middle;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* Grid dividers */
+  th+th, td+td{border-left:1px solid var(--border)}
+  tbody tr+tr td{border-top:1px solid var(--border)}
+  .order small{display:block;color:var(--muted);margin-top:3px}
+  .pill{display:inline-block;padding:4px 10px;border-radius:999px;background:var(--pill);color:var(--pillfg);font-size:12px}
+  .actions-cell{display:flex;gap:10px;align-items:center}
+  .actions-cell select{min-width:140px}
+  .save-btn{height:36px;border-radius:10px;background:var(--primary);color:#fff;border:0;padding:0 16px;cursor:pointer}
   .muted{color:var(--muted)}
-  .orderCell a{font-weight:700;text-decoration:none;color:#0f172a}
-  .orderId{margin-top:4px;font-size:12px;color:var(--muted)}
-
-  /* Actions column */
-  th.actions, td.actions{width:260px}
-  td.actions{padding-right:18px}
-  .actionsRow{display:flex;align-items:center;gap:12px;justify-content:flex-end}
-  .actionsRow select{min-width:150px;height:40px;border-radius:10px}
-  .actionsRow .save{min-width:92px;height:40px;border-radius:10px;background:var(--primary);color:#fff;border:0}
-
-  /* Ticket link */
-  .tkt{color:#1d4ed8;text-decoration:none;font-weight:600}
-
-  /* Clip long text cells to one line */
-  .clip{max-width:260px}
-
-  /* Toast */
   .toast{position:fixed;right:16px;bottom:16px;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s}
   .toast.show{opacity:1;transform:translateY(0)}
 
   /* Modal */
-  .backdrop{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;z-index:50}
-  .backdrop.show{display:flex}
-  .modal{width:min(980px,92vw);background:#fff;border:1px solid var(--border);border-radius:18px;box-shadow:0 25px 80px rgba(0,0,0,.25)}
-  .m-hd{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid var(--border)}
-  .m-tt{font-size:20px;font-weight:800}
-  .m-x{border:0;background:transparent;font-size:20px;cursor:pointer}
-  .m-bd{padding:20px}
-  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-  .fld label{display:block;font-size:12px;color:var(--muted);margin:0 0 6px 2px}
-  .fld input,.fld select,.fld textarea{width:100%;height:42px;border:1px solid var(--border);border-radius:10px;padding:0 12px;background:#fff}
-  .fld textarea{height:120px;resize:vertical;padding:10px 12px}
-  .m-ft{display:flex;gap:12px;justify-content:space-between;padding:16px 20px;border-top:1px solid var(--border)}
-  .btn{height:44px;border-radius:10px;padding:0 16px;border:1px solid var(--border);background:#fff}
-  .btn.primary{background:var(--primary);color:#fff;border:0}
+  .overlay{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;padding:16px}
+  .overlay.show{display:flex}
+  .modal{width:min(980px,95vw);background:#fff;border-radius:16px;border:1px solid var(--border);box-shadow:0 30px 80px rgba(0,0,0,.25)}
+  .modal .head{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid var(--border)}
+  .modal .head .h{font-weight:700}
+  .modal .body{padding:18px 20px;display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .modal label{font-size:12px;color:var(--muted)}
+  .modal input, .modal select, .modal textarea{width:100%;height:40px;border:1px solid var(--border);border-radius:10px;padding:0 12px}
+  .modal textarea{height:120px;padding:10px 12px;resize:vertical}
+  .modal .foot{display:flex;gap:10px;padding:14px 20px;border-top:1px solid var(--border)}
+  .modal .btn{height:42px;border-radius:10px;border:0;padding:0 16px;cursor:pointer}
+  .modal .primary{background:var(--primary);color:#fff}
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="topbar">
     <div class="title">Support tickets</div>
-    <a class="logout" href="/admin/logout" title="Log out">Logout</a>
+    <a class="logout" href="/admin/logout">Logout</a>
   </div>
 
   <div class="card">
+    <!-- Tabs -->
     <div class="tabs" id="tabs">
-      <button class="tab active" data-status="all">All <span class="count" id="c_all">0</span></button>
-      <button class="tab" data-status="pending">Pending <span class="count" id="c_pending">0</span></button>
-      <button class="tab" data-status="in_progress">In progress <span class="count" id="c_in_progress">0</span></button>
-      <button class="tab" data-status="resolved">Resolved <span class="count" id="c_resolved">0</span></button>
-      <button class="tab" data-status="closed">Closed <span class="count" id="c_closed">0</span></button>
+      <button class="chip active" data-status="all">All <span class="count" id="c_all">0</span></button>
+      <button class="chip" data-status="pending">Pending <span class="count" id="c_pending">0</span></button>
+      <button class="chip" data-status="in_progress">In progress <span class="count" id="c_in_progress">0</span></button>
+      <button class="chip" data-status="resolved">Resolved <span class="count" id="c_resolved">0</span></button>
+      <button class="chip" data-status="closed">Closed <span class="count" id="c_closed">0</span></button>
     </div>
 
+    <!-- Filters -->
     <div class="filters">
       <label>Status
         <select id="st">
@@ -602,29 +587,26 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
         <input id="since" type="date"/>
       </label>
       <label>Limit
-        <input id="lim" type="number" value="200" min="1" max="1000"/>
+        <input id="lim" type="number" min="1" max="1000" value="200"/>
       </label>
       <label>Search (ticket/order/name/email)
         <input id="q" placeholder="Type to filter…"/>
       </label>
-      <button id="go">Refresh</button>
-      <button id="clr" class="ghost" type="button">Clear</button>
+      <button id="go" class="btn">Refresh</button>
+      <button id="clr" class="btn ghost" type="button">Clear</button>
     </div>
 
-    <div id="err" class="muted" style="display:none"></div>
-
+    <!-- Table -->
     <div class="table-wrap">
       <table id="tbl">
+        <colgroup>
+          <col class="order"><col class="ticket"><col class="status"><col class="issue">
+          <col class="customer"><col class="when"><col class="when2"><col class="actions">
+        </colgroup>
         <thead>
           <tr>
-            <th style="width:240px">Order</th>
-            <th style="width:220px">Ticket</th>
-            <th style="width:150px">Status</th>
-            <th style="width:220px">Issue</th>
-            <th style="width:160px">Customer</th>
-            <th style="width:170px">Created</th>
-            <th style="width:170px">Updated</th>
-            <th class="actions">Actions</th>
+            <th>Order</th><th>Ticket</th><th>Status</th><th>Issue</th>
+            <th>Customer</th><th>Created</th><th>Updated</th><th>Actions</th>
           </tr>
         </thead>
         <tbody><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
@@ -633,168 +615,212 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   </div>
 </div>
 
-<div id="toast" class="toast"></div>
-
 <!-- Modal -->
-<div id="backdrop" class="backdrop">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mTitle">
-    <div class="m-hd">
-      <div id="mTitle" class="m-tt">Ticket</div>
-      <button class="m-x" id="mClose" aria-label="Close">×</button>
+<div id="overlay" class="overlay" role="dialog" aria-modal="true">
+  <div class="modal">
+    <div class="head">
+      <div class="h" id="mh"></div>
+      <button id="mx" class="btn ghost" style="height:36px;border:1px solid var(--border);border-radius:8px">✕</button>
     </div>
-    <div class="m-bd">
-      <div class="grid2">
-        <div class="fld"><label>Ticket ID</label><input id="m_tid" readonly></div>
-        <div class="fld"><label>Order</label><input id="m_order" readonly></div>
-        <div class="fld"><label>Status</label>
-          <select id="m_status">
-            <option value="pending">pending</option>
-            <option value="in_progress">in_progress</option>
-            <option value="resolved">resolved</option>
-            <option value="closed">closed</option>
-          </select>
-        </div>
-        <div class="fld"><label>Issue</label><input id="m_issue" readonly></div>
-        <div class="fld"><label>Name</label><input id="m_name" readonly></div>
-        <div class="fld"><label>Email</label><input id="m_email" readonly></div>
-        <div class="fld"><label>Phone</label><input id="m_phone" readonly></div>
-        <div class="fld"><label>Message</label><textarea id="m_message" readonly></textarea></div>
-        <div class="fld"><label>Created</label><input id="m_created" readonly></div>
-        <div class="fld"><label>Updated</label><input id="m_updated" readonly></div>
-      </div>
+    <div class="body">
+      <label>Ticket ID
+        <input id="m_tid" readonly>
+      </label>
+      <label>Order
+        <input id="m_order" readonly>
+      </label>
+      <label>Status
+        <select id="m_status">
+          <option value="pending">pending</option>
+          <option value="in_progress">in_progress</option>
+          <option value="resolved">resolved</option>
+          <option value="closed">closed</option>
+        </select>
+      </label>
+      <label>Issue
+        <input id="m_issue" readonly>
+      </label>
+      <label>Name
+        <input id="m_name" readonly>
+      </label>
+      <label>Email
+        <input id="m_email" readonly>
+      </label>
+      <label>Phone
+        <input id="m_phone" readonly>
+      </label>
+      <label>Message
+        <textarea id="m_message" readonly></textarea>
+      </label>
+      <label>Created
+        <input id="m_created" readonly>
+      </label>
+      <label>Updated
+        <input id="m_updated" readonly>
+      </label>
     </div>
-    <div class="m-ft">
-      <button class="btn primary" id="mSave">Save</button>
-      <button class="btn" id="mClose2">Close</button>
+    <div class="foot">
+      <button id="msave" class="btn primary">Save</button>
+      <button id="mclose" class="btn">Close</button>
     </div>
   </div>
 </div>
 
+<div id="toast" class="toast"></div>
+
 <script nonce="${nonce}">
-const $  = (s)=>document.querySelector(s);
-const $$ = (s)=>document.querySelectorAll(s);
-const esc = (v)=> String(v ?? "").replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\\'':'&#39;'}[ch]));
-const fmt = (d)=> d ? new Date(d).toLocaleString() : "—";
-const show = (msg)=>{ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); };
+(function(){
+  const $  = (s)=>document.querySelector(s);
+  const $$ = (s)=>document.querySelectorAll(s);
+  const esc = (v)=> String(v ?? "").replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  const fmt = (d)=> d ? new Date(d).toLocaleString() : "—";
+  const pill = (s)=> '<span class="pill">'+esc(String(s||"").replace("_"," "))+'</span>';
+  const show = (msg)=>{ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); };
 
-let currentStatus="all", cacheTickets=[], currentRow=null;
+  let currentStatus = "all";
+  let cacheTickets  = [];
+  function counts(list){
+    const c = { all:list.length, pending:0, in_progress:0, resolved:0, closed:0 };
+    list.forEach(t => { const s=(t.status||"pending").toLowerCase(); if (c[s]!=null) c[s]++; });
+    $("#c_all").textContent=c.all; $("#c_pending").textContent=c.pending; $("#c_in_progress").textContent=c.in_progress; $("#c_resolved").textContent=c.resolved; $("#c_closed").textContent=c.closed;
+  }
+  function orderCell(t){
+    const id = t.order_id ? String(t.order_id) : "—";
+    const name = t.order_name ? String(t.order_name) : "—";
+    return '<div class="order"><div>'+esc(name)+'</div><small>ID: '+esc(id)+'</small></div>';
+  }
+  function row(t){
+    const order = orderCell(t);
+    const created = fmt(t.created_at), updated = fmt(t.updated_at);
+    const ticketLink = '<a href="#" class="ticket-link" data-tid="'+esc(t.ticket_id)+'">'+esc(t.ticket_id)+'</a>';
+    return \`<tr data-row="\${esc(t.ticket_id)}">
+      <td>\${order}</td>
+      <td>\${ticketLink}</td>
+      <td>\${pill(t.status)}</td>
+      <td>\${esc(t.issue || "—")}</td>
+      <td>\${esc(t.name || "—")}</td>
+      <td>\${created}</td>
+      <td>\${updated}</td>
+      <td>
+        <div class="actions-cell">
+          <select class="set">
+            <option value="pending" \${t.status==="pending"?"selected":""}>pending</option>
+            <option value="in_progress" \${t.status==="in_progress"?"selected":""}>in_progress</option>
+            <option value="resolved" \${t.status==="resolved"?"selected":""}>resolved</option>
+            <option value="closed" \${t.status==="closed"?"selected":""}>closed</option>
+          </select>
+          <button class="save-btn save" data-oid="\${t.order_id}" data-tid="\${esc(t.ticket_id)}">Save</button>
+        </div>
+      </td>
+    </tr>\`;
+  }
+  function applyFilter(list){
+    const q = ($("#q").value||"").toLowerCase();
+    return list.filter(t => {
+      const matchStatus = currentStatus==="all" ? true : (String(t.status).toLowerCase()===currentStatus);
+      if(!matchStatus) return false;
+      if(!q) return true;
+      return [t.ticket_id,t.order_name,t.name,t.email].filter(Boolean).some(x=>String(x).toLowerCase().includes(q));
+    });
+  }
+  function render(list){
+    counts(list);
+    const rows = applyFilter(list).map(row).join("") || '<tr><td colspan="8" class="muted">No tickets</td></tr>';
+    $("#tbl tbody").innerHTML = rows;
 
-function setActiveTab(status){
-  currentStatus=status;
-  $$("#tabs .tab").forEach(b=>b.classList.toggle("active", b.dataset.status===status));
-  $("#st").value=status; render(cacheTickets);
-}
-function counts(list){
-  const c={all:list.length,pending:0,in_progress:0,resolved:0,closed:0};
-  list.forEach(t=>{const s=(t.status||"pending").toLowerCase(); if(c[s]!=null) c[s]++;});
-  $("#c_all").textContent=c.all; $("#c_pending").textContent=c.pending; $("#c_in_progress").textContent=c.in_progress; $("#c_resolved").textContent=c.resolved; $("#c_closed").textContent=c.closed;
-}
-function orderCell(t){
-  const no = esc(t.order_name||"");
-  const id = String(t.order_id||"");
-  return \`<div class="orderCell">
-    <a href="#" data-oid="\${id}" class="ord">\${no}</a>
-    <div class="orderId muted">ID: \${id||"—"}</div>
-  </div>\`;
-}
-function row(t){
-  const clip = (v)=> \`<span class="clip" title="\${esc(v||"")}">\${esc(v||"")}</span>\`;
-  return \`<tr data-oid="\${t.order_id}" data-tid="\${esc(t.ticket_id)}">
-    <td>\${orderCell(t)}</td>
-    <td><a href="#" class="tkt" data-open="1">\${esc(t.ticket_id||"")}</a></td>
-    <td><span class="pill">\${esc(String(t.status||"").replace("_"," "))}</span></td>
-    <td>\${clip(t.issue)}</td>
-    <td>\${clip(t.name)}</td>
-    <td>\${fmt(t.created_at)}</td>
-    <td>\${fmt(t.updated_at)}</td>
-    <td class="actions"><div class="actionsRow">
-      <select class="set">
-        <option value="pending" \${t.status==="pending"?"selected":""}>pending</option>
-        <option value="in_progress" \${t.status==="in_progress"?"selected":""}>in_progress</option>
-        <option value="resolved" \${t.status==="resolved"?"selected":""}>resolved</option>
-        <option value="closed" \${t.status==="closed"?"selected":""}>closed</option>
-      </select>
-      <button class="save">Save</button>
-    </div></td>
-  </tr>\`;
-}
-function render(list){
-  counts(list);
-  const q = ($("#q").value||"").toLowerCase();
-  const rows = list.filter(t=>{
-    const byStatus = currentStatus==="all" ? true : (String(t.status).toLowerCase()===currentStatus);
-    if(!byStatus) return false;
-    if(!q) return true;
-    return [t.ticket_id,t.order_name,t.name,t.email].filter(Boolean).some(x=>String(x).toLowerCase().includes(q));
-  }).map(row).join("") || '<tr><td colspan="8" class="muted">No tickets</td></tr>';
-  $("#tbl tbody").innerHTML = rows;
+    // per-row Save
+    $("#tbl").querySelectorAll(".save").forEach(btn=>{
+      btn.onclick = async ()=>{
+        const tr = btn.closest("tr");
+        const select = tr.querySelector(".set");
+        const status = select.value;
+        const body = { order_id: btn.dataset.oid, ticket_id: btn.dataset.tid, status };
+        const r = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
+        const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
+        if(!j.ok){ alert("Update failed: " + (j.error||"unexpected")); return; }
+        // Update local cache, re-render instantly
+        const idx = cacheTickets.findIndex(x => String(x.ticket_id)===String(j.ticket.ticket_id));
+        if(idx>=0) cacheTickets[idx] = { ...cacheTickets[idx], ...j.ticket };
+        else cacheTickets.push(j.ticket);
+        show("Updated");
+        render(cacheTickets);  // row jumps to the right tab immediately
+      };
+    });
 
-  // Wire actions
-  $("#tbl tbody").querySelectorAll("button.save").forEach(btn=>{
-    btn.onclick = async (e)=>{
-      const tr = e.target.closest("tr");
-      const status = tr.querySelector("select.set").value;
-      const body = { order_id: tr.dataset.oid, ticket_id: tr.dataset.tid, status };
-      const r2 = await fetch("/admin/ui/update",{ method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
-      const j2 = await r2.json().catch(()=>({ok:false,error:"bad_json"}));
-      if(!j2.ok) alert("Update failed: " + j2.error);
-      else { show("Updated"); load(); }
-    };
+    // Ticket modal
+    $("#tbl").querySelectorAll(".ticket-link").forEach(a=>{
+      a.onclick = (e)=>{
+        e.preventDefault();
+        const t = cacheTickets.find(x => String(x.ticket_id)===String(a.dataset.tid));
+        if(!t) return;
+        $("#mh").textContent = "Ticket • " + t.ticket_id;
+        $("#m_tid").value = t.ticket_id || "";
+        $("#m_order").value = (t.order_name || "") + (t.order_id ? "  (ID: "+t.order_id+")" : "");
+        $("#m_status").value = t.status || "pending";
+        $("#m_issue").value  = t.issue || "";
+        $("#m_name").value   = t.name || "";
+        $("#m_email").value  = t.email || "";
+        $("#m_phone").value  = t.phone || "";
+        $("#m_message").value= t.message || "";
+        $("#m_created").value= fmt(t.created_at);
+        $("#m_updated").value= fmt(t.updated_at);
+        $("#overlay").classList.add("show");
+      };
+    });
+  }
+
+  async function load(){
+    const qs = new URLSearchParams({
+      status: $("#st").value || "all",
+      since:  $("#since").value || "",
+      limit:  $("#lim").value  || 200
+    });
+    const r = await fetch("/admin/ui/tickets?"+qs.toString(), { credentials:"include" });
+    const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
+    const list = j?.tickets || [];
+    cacheTickets = Array.isArray(list) ? list : [];
+    render(cacheTickets);
+  }
+
+  // Tabs / filters wiring
+  $("#tabs").addEventListener("click",(e)=>{
+    const b = e.target.closest(".chip");
+    if(!b) return;
+    currentStatus = b.dataset.status;
+    $$("#tabs .chip").forEach(x=>x.classList.toggle("active", x===b));
+    $("#st").value = currentStatus;
+    render(cacheTickets);
   });
+  $("#st").onchange = ()=>{ currentStatus=$("#st").value; $$("#tabs .chip").forEach(x=>x.classList.toggle("active", x.dataset.status===currentStatus)); render(cacheTickets); };
+  $("#q").oninput = ()=> render(cacheTickets);
+  $("#go").onclick  = load;
+  $("#clr").onclick = ()=>{ $("#st").value="all"; $("#since").value=""; $("#lim").value=200; $("#q").value=""; currentStatus="all"; $$("#tabs .chip").forEach(x=>x.classList.toggle("active", x.dataset.status==="all")); load(); };
 
-  // Ticket click → modal
-  $("#tbl tbody").querySelectorAll('a.tkt').forEach(a=>{
-    a.onclick = (e)=>{ e.preventDefault(); openModal(e.target.closest("tr")); };
-  });
-}
-async function load(){
-  $("#err").style.display="none";
-  const qs = new URLSearchParams({ status: $("#st").value||"all", since: $("#since").value||"", limit: $("#lim").value||200 });
-  const r = await fetch("/admin/ui/tickets?"+qs.toString(), { credentials:"include" });
-  if (r.status === 401) { $("#err").textContent="Auth required. Reload the page."; $("#err").style.display="block"; return; }
-  const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
-  if(!j.ok && !Array.isArray(j.tickets)){ $("#err").textContent = "Failed: " + (j.error||"unexpected"); $("#err").style.display="block"; $("#tbl tbody").innerHTML=""; return; }
-  const list = Array.isArray(j.tickets) ? j.tickets : j;
-  cacheTickets = list || []; render(cacheTickets);
-}
+  // Modal buttons
+  const closeModal = ()=> $("#overlay").classList.remove("show");
+  $("#mclose").onclick = closeModal;
+  $("#mx").onclick = closeModal;
+  $("#overlay").addEventListener("click",(e)=>{ if(e.target.id==="overlay") closeModal(); });
 
-// Modal helpers
-function openModal(tr){
-  currentRow = tr;
-  const rec = cacheTickets.find(x=> String(x.order_id)===tr.dataset.oid && String(x.ticket_id)===tr.dataset.tid) || {};
-  $("#mTitle").textContent = "Ticket • " + (rec.ticket_id||"");
-  $("#m_tid").value   = rec.ticket_id||"";
-  $("#m_order").value = (rec.order_name||"") + (rec.order_id? "  (ID: "+rec.order_id+")" : "");
-  $("#m_status").value= rec.status||"pending";
-  $("#m_issue").value = rec.issue||"";
-  $("#m_name").value  = rec.name||"";
-  $("#m_email").value = rec.email||"";
-  $("#m_phone").value = rec.phone||"";
-  $("#m_message").value = rec.message||"";
-  $("#m_created").value= fmt(rec.created_at);
-  $("#m_updated").value= fmt(rec.updated_at);
-  $("#backdrop").classList.add("show");
-}
-function closeModal(){ $("#backdrop").classList.remove("show"); }
+  // Modal save (also live update)
+  $("#msave").onclick = async ()=>{
+    const tid = $("#m_tid").value;
+    const t   = cacheTickets.find(x => String(x.ticket_id)===String(tid));
+    if(!t) return;
+    const body = { order_id: t.order_id, ticket_id: t.ticket_id, status: $("#m_status").value };
+    const r = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
+    const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
+    if(!j.ok){ alert("Update failed: " + (j.error||"unexpected")); return; }
+    const idx = cacheTickets.findIndex(x => String(x.ticket_id)===String(j.ticket.ticket_id));
+    if(idx>=0) cacheTickets[idx] = { ...cacheTickets[idx], ...j.ticket };
+    closeModal();
+    show("Updated");
+    render(cacheTickets);
+  };
 
-$("#mClose").onclick = closeModal; $("#mClose2").onclick = closeModal;
-$("#mSave").onclick = async ()=>{
-  if(!currentRow) return;
-  const body = { order_id: currentRow.dataset.oid, ticket_id: currentRow.dataset.tid, status: $("#m_status").value };
-  const r2 = await fetch("/admin/ui/update",{ method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
-  const j2 = await r2.json().catch(()=>({ok:false,error:"bad_json"}));
-  if(!j2.ok) alert("Update failed: " + j2.error);
-  else { show("Updated"); closeModal(); load(); }
-};
-
-// Events
-$("#tabs").addEventListener("click",(e)=>{ const b=e.target.closest(".tab"); if(b) setActiveTab(b.dataset.status); });
-$("#st").onchange = ()=> setActiveTab($("#st").value);
-$("#go").onclick  = load;
-$("#clr").onclick = ()=>{ $("#st").value="all"; $("#since").value=""; $("#lim").value=200; $("#q").value=""; setActiveTab("all"); load(); };
-$("#q").oninput   = ()=> render(cacheTickets);
-
-load();
+  // initial load
+  load();
+})();
 </script>
 </body>
 </html>`);
