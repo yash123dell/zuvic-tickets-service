@@ -24,22 +24,26 @@ app.disable("x-powered-by");
 app.set("trust proxy", true);
 
 // --- security middleware
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "same-site" }
-}));
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: "same-site" }, // allow same-site static
+  })
+);
 app.use(rateLimit({ windowMs: 60 * 1000, max: 180 })); // 180 req/min per IP
 app.use(cookieParser());
 app.use(express.json({ limit: "512kb" }));
 app.use(express.urlencoded({ extended: false }));
 
 // Serve static (only used if you add files into /public)
-app.use(express.static(path.join(__dirname, "public"), {
-  setHeaders: (res) => {
-    // never cache admin resources
-    res.setHeader("Cache-Control", "no-store, must-revalidate");
-    res.setHeader("Pragma", "no-cache");
-  }
-}));
+app.use(
+  express.static(path.join(__dirname, "public"), {
+    setHeaders: (res) => {
+      // never cache admin resources
+      res.setHeader("Cache-Control", "no-store, must-revalidate");
+      res.setHeader("Pragma", "no-cache");
+    },
+  })
+);
 
 const PORT         = process.env.PORT || 3000;
 const PROXY_MOUNT  = process.env.PROXY_MOUNT || "/tickets";
@@ -49,12 +53,17 @@ const ADMIN_TOKEN  = process.env.SHOPIFY_ADMIN_TOKEN || "";
 const API_VERSION  = process.env.SHOPIFY_API_VERSION || process.env.API_VERSION || "2024-10";
 const SKIP_VERIFY  = process.env.SKIP_PROXY_VERIFY === "1";
 
+// ---- basic env checks (log warnings only)
+if (!SHOPIFY_SHOP)  console.warn("[warn] SHOPIFY_SHOP not set");
+if (!ADMIN_TOKEN)   console.warn("[warn] SHOPIFY_ADMIN_TOKEN not set");
+if (!PROXY_SECRET)  console.warn("[warn] PROXY_SECRET not set (App Proxy calls will 401)");
+
 // ---- health
 app.get("/healthz", (_req, res) => res.type("text").send("ok"));
 
 // ---- App Proxy signature helpers
 function expectedHmacFromReq(req, secret) {
-  const rawQs = (req.originalUrl.split("?")[1] || "");
+  const rawQs = req.originalUrl.split("?")[1] || "";
   const usp = new URLSearchParams(rawQs);
   const pairs = [];
   for (const [k, v] of usp) if (k !== "signature") pairs.push([k, v]);
@@ -118,7 +127,9 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
     } = req.body || {};
 
     if (!order_id || !ticket_id) {
-      return res.status(400).json({ ok: false, error: "missing_fields", fields: ["order_id","ticket_id"] });
+      return res
+        .status(400)
+        .json({ ok: false, error: "missing_fields", fields: ["order_id", "ticket_id"] });
     }
 
     const orderGid = `gid://shopify/Order/${String(order_id)}`;
@@ -135,7 +146,9 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
 
     let map = {};
     const mf = d1?.order?.tickets;
-    if (mf?.value) { try { map = JSON.parse(mf.value); } catch { map = {}; } }
+    if (mf?.value) {
+      try { map = JSON.parse(mf.value); } catch { map = {}; }
+    }
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
@@ -161,7 +174,12 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
           { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$status }
         ]) { userErrors { field message } }
       }`;
-    const d2 = await adminGraphQL(q2, { ownerId: orderGid, value: JSON.stringify(map), ticketId: ticket_id, status });
+    const d2 = await adminGraphQL(q2, {
+      ownerId: orderGid,
+      value: JSON.stringify(map),
+      ticketId: ticket_id,
+      status,
+    });
     const err = d2?.metafieldsSet?.userErrors?.[0];
     if (err) throw new Error(err.message);
 
@@ -295,7 +313,7 @@ async function collectTickets({ since, status, limit = 200 }) {
 
       let map = {};
       const raw = node.mfJSON?.value;
-      if (raw) { try { map = JSON.parse(raw); } catch (_) {} }
+      if (raw) { try { map = JSON.parse(raw); } catch {} }
 
       if (Object.keys(map).length) {
         for (const [key, t] of Object.entries(map)) {
@@ -374,7 +392,7 @@ app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
     const d1 = await adminGraphQL(q1, { id: orderGid });
     let map = {};
     const raw = d1?.order?.metafield?.value;
-    if (raw) { try { map = JSON.parse(raw); } catch (_) {} }
+    if (raw) { try { map = JSON.parse(raw); } catch {} }
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
@@ -559,8 +577,12 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
 <script>
 const $  = (s)=>document.querySelector(s);
 const $$ = (s)=>document.querySelectorAll(s);
-const esc = (v)=>String(v ?? "").replace(/[&<>"']/g, s=>({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&#34;","'":"&#39;"}[s]));
-const fmt = (d)=> d ? new Date(d).toLocaleString() : "—";
+
+function esc(v){
+  const map = { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" };
+  return String(v ?? "").replace(/[&<>"']/g, s => map[s]);
+}
+const fmt  = (d)=> d ? new Date(d).toLocaleString() : "—";
 const show = (msg)=>{ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1400); };
 
 function pill(status){
@@ -690,7 +712,7 @@ app.post("/admin/ui/update", requireUIPassword, async (req, res) => {
 
     let map = {};
     const raw = d1?.order?.metafield?.value;
-    if (raw) { try { map = JSON.parse(raw); } catch(_){} }
+    if (raw) { try { map = JSON.parse(raw); } catch{} }
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
