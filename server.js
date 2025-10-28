@@ -550,51 +550,81 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
     `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'self'; frame-ancestors 'none'`
   );
 
-  // Inline fallback UI (tabs in one line)
-  res
-    .type("html")
-    .send(`<!doctype html>
+  // Single-line table UI + modal details
+  res.type("html").send(`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>ZUVIC • Support tickets</title>
 <style>
-  :root{ --bg:#f6f7fb; --fg:#0f172a; --muted:#64748b; --card:#fff; --border:#e5e7eb; --primary:#1d4ed8;
-         --tab:#eef2ff; --tabfg:#3730a3; }
+  :root{
+    --bg:#0b1220; --card:#0f172a; --fg:#e5e7eb; --muted:#94a3b8; --border:#1f2937;
+    --header:#0b1220; --headerfg:#9aa7bd; --primary:#2563eb; --accent:#60a5fa;
+    --pillbg:#0b2a55; --pillfg:#c7ddff;
+  }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{opacity:.9}
   .wrap{padding:24px;max-width:1400px;margin:0 auto}
   .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
   .title{font-size:28px;font-weight:700}
-  .logout{color:var(--primary);text-decoration:none}
+  .logout{color:var(--accent);text-decoration:none}
+
   .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px}
 
-  /* Single-row Tabs */
+  /* Tabs single line */
   .tabs{display:flex;gap:8px;flex-wrap:nowrap;overflow:auto;white-space:nowrap;margin-bottom:12px;-webkit-overflow-scrolling:touch}
-  .tab{padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:#fff;color:#111;cursor:pointer}
+  .tab{padding:8px 12px;border:1px solid var(--border);border-radius:999px;background:#0d1528;color:#dbe7ff;cursor:pointer}
   .tab.active{background:var(--primary);border-color:var(--primary);color:#fff}
   .tab .count{opacity:.85;margin-left:6px}
 
   /* Filters */
   .filters{display:grid;grid-template-columns:180px 180px 120px 1fr auto auto;gap:10px;margin-bottom:10px}
   label{font-size:12px;color:var(--muted)}
-  select,input,button{width:100%;height:36px;border:1px solid var(--border);border-radius:8px;padding:0 10px;background:#fff;color:var(--fg)}
+  select,input,button{width:100%;height:36px;border:1px solid var(--border);border-radius:8px;padding:0 10px;background:#0b1220;color:var(--fg)}
   button{border-color:var(--primary);background:var(--primary);color:#fff;cursor:pointer}
-  button.ghost{background:#fff;color:#111}
+  button.ghost{background:#0b1220}
 
-  /* Table */
-  .table-wrap{overflow:auto;border-radius:10px;border:1px solid var(--border);background:#fff}
-  table{width:100%;border-collapse:collapse;min-width:1100px}
-  th,td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}
-  th{position:sticky;top:0;background:#fafafa;font-weight:600;color:#334155;z-index:1}
-  tr:nth-child(even){background:#fcfcff}
-  .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--tab);color:var(--tabfg);font-size:12px}
+  /* Table – single line with ellipsis */
+  .table-wrap{overflow:auto;border-radius:10px;border:1px solid var(--border);background:#0c1426}
+  table{width:100%;border-collapse:collapse;min-width:1100px;table-layout:fixed}
+  th,td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:middle;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  th{position:sticky;top:0;background:#0b1220;font-weight:600;color:var(--headerfg);z-index:1}
+  tr:nth-child(even){background:#0e1a31}
+  code{background:#0b1220;border:1px solid var(--border);border-radius:6px;padding:2px 6px}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--pillbg);color:var(--pillfg);font-size:12px}
+  .row-actions{display:flex;gap:8px;justify-content:flex-end}
   .muted{color:var(--muted)}
-  code{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:6px;padding:2px 6px}
-  .row-actions{display:flex;gap:8px}
   .toast{position:fixed;right:16px;bottom:16px;background:#111827;color:#fff;padding:10px 12px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s}
   .toast.show{opacity:1;transform:translateY(0)}
+
+  /* Column widths (keep one line) */
+  .col-order{width:230px}
+  .col-ticket{width:210px}
+  .col-status{width:140px}
+  .col-issue{width:170px}
+  .col-customer{width:180px}
+  .col-created{width:170px}
+  .col-updated{width:170px}
+  .col-actions{width:120px}
+
+  /* Truncate helper */
+  .truncate{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  /* Modal */
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;padding:16px}
+  .modal.show{display:flex}
+  .sheet{width:min(720px,100%);background:var(--card);border:1px solid var(--border);border-radius:14px}
+  .sheet .hd{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border)}
+  .sheet .bd{padding:16px;display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .sheet .ft{display:flex;gap:8px;justify-content:flex-end;padding:12px 16px;border-top:1px solid var(--border)}
+  .kv{display:flex;flex-direction:column;gap:6px}
+  .kv label{font-size:12px;color:var(--muted)}
+  .kv input, .kv textarea, .kv select{height:38px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:var(--fg);padding:0 10px}
+  .kv textarea{height:84px;padding:10px;resize:vertical}
+  .x{appearance:none;border:0;background:#172042;color:#cbd5e1;border-radius:8px;height:34px;padding:0 10px;cursor:pointer}
 </style>
 </head>
 <body>
@@ -645,13 +675,17 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
       <table id="tbl">
         <thead>
           <tr>
-            <th>TICKET</th><th>STATUS</th><th>ORDER</th>
-            <th>CREATED</th><th>UPDATED</th>
-            <th>NAME</th><th>EMAIL</th><th>PHONE</th>
-            <th>ISSUE</th><th>MESSAGE</th><th style="width:200px">ACTIONS</th>
+            <th class="col-order">Order</th>
+            <th class="col-ticket">Ticket</th>
+            <th class="col-status">Status</th>
+            <th class="col-issue">Issue</th>
+            <th class="col-customer">Customer</th>
+            <th class="col-created">Created</th>
+            <th class="col-updated">Updated</th>
+            <th class="col-actions">Actions</th>
           </tr>
         </thead>
-        <tbody><tr><td colspan="11" class="muted">Loading…</td></tr></tbody>
+        <tbody><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -659,25 +693,54 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
 
 <div id="toast" class="toast"></div>
 
+<!-- Modal -->
+<div id="modal" class="modal" aria-hidden="true" role="dialog">
+  <div class="sheet" role="document">
+    <div class="hd">
+      <div id="m_title" class="truncate" style="max-width:80%"></div>
+      <button class="x" id="m_close">Close</button>
+    </div>
+    <div class="bd">
+      <div class="kv"><label>Order</label><input id="m_order" readonly></div>
+      <div class="kv"><label>Ticket</label><input id="m_ticket" readonly></div>
+      <div class="kv"><label>Status</label>
+        <select id="m_status">
+          <option value="pending">pending</option>
+          <option value="in_progress">in_progress</option>
+          <option value="resolved">resolved</option>
+          <option value="closed">closed</option>
+        </select>
+      </div>
+      <div class="kv"><label>Customer name</label><input id="m_name" readonly></div>
+      <div class="kv"><label>Email</label><input id="m_email" readonly></div>
+      <div class="kv"><label>Phone</label><input id="m_phone" readonly></div>
+      <div class="kv" style="grid-column:1/-1"><label>Issue</label><input id="m_issue" readonly></div>
+      <div class="kv" style="grid-column:1/-1"><label>Message</label><textarea id="m_message" readonly></textarea></div>
+      <div class="kv"><label>Created</label><input id="m_created" readonly></div>
+      <div class="kv"><label>Updated</label><input id="m_updated" readonly></div>
+    </div>
+    <div class="ft">
+      <button class="x" id="m_cancel">Cancel</button>
+      <button id="m_save">Save</button>
+    </div>
+  </div>
+</div>
+
 <script nonce="${nonce}">
+/* Helpers */
 const $  = (s)=>document.querySelector(s);
 const $$ = (s)=>document.querySelectorAll(s);
-const esc = (v) =>
-  String(v ?? "").replace(/[&<>"']/g, (ch) => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  })[ch]);
+const esc = (v)=> String(v ?? "").replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\\'':'&#39;'}[ch]));
 const fmt = (d)=> d ? new Date(d).toLocaleString() : "—";
 const show = (msg)=>{ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); };
 const pill = (s)=> '<span class="pill">'+esc(String(s||"").replace("_"," "))+'</span>';
-const cell = (v)=> v ? esc(v) : "—";
+const trunc = (v)=> v ? esc(v) : "—";
 
 let currentStatus = "all";
 let cacheTickets  = [];
+let currentIdx    = -1;
 
+/* Tabs & counts */
 function setActiveTab(status){
   currentStatus = status;
   $$("#tabs .tab").forEach(btn => btn.classList.toggle("active", btn.dataset.status===status));
@@ -693,18 +756,20 @@ function counts(list){
   $("#c_resolved").textContent = c.resolved;
   $("#c_closed").textContent = c.closed;
 }
-function row(t){
-  return \`<tr>
-    <td><code>\${esc(t.ticket_id||"")}</code></td>
+
+/* Row template — all values single line with ellipsis; order shows both number & ID */
+function row(t,i){
+  const orderText = \`\${t.order_name||t.order_id||""} (ID:\${t.order_id||"-"})\`;
+  return \`<tr data-i="\${i}">
+    <td class="truncate" title="\${esc(orderText)}"><code>\${esc(orderText)}</code></td>
+    <td class="truncate" title="\${esc(t.ticket_id||"")}">
+      <a href="#" class="tk" data-i="\${i}"><code>\${esc(t.ticket_id||"")}</code></a>
+    </td>
     <td>\${pill(t.status)}</td>
-    <td><code>\${esc(t.order_name||t.order_id||"")}</code></td>
+    <td class="truncate" title="\${esc(t.issue||"")}">\${trunc(t.issue)}</td>
+    <td class="truncate" title="\${esc([t.name,t.email].filter(Boolean).join(" · "))}">\${esc(t.name||"—")}</td>
     <td>\${fmt(t.created_at)}</td>
     <td>\${fmt(t.updated_at)}</td>
-    <td>\${cell(t.name)}</td>
-    <td>\${cell(t.email)}</td>
-    <td>\${cell(t.phone)}</td>
-    <td>\${cell(t.issue)}</td>
-    <td>\${cell(t.message)}</td>
     <td class="row-actions">
       <select class="set">
         <option value="pending" \${t.status==="pending"?"selected":""}>pending</option>
@@ -716,17 +781,23 @@ function row(t){
     </td>
   </tr>\`;
 }
+
 function render(list){
   counts(list);
   const q = ($("#q").value||"").toLowerCase();
-  const rows = list.filter(t => {
-    const byStatus = currentStatus==="all" ? true : (String(t.status).toLowerCase()===currentStatus);
-    if (!byStatus) return false;
-    if (!q) return true;
-    return [t.ticket_id,t.order_name,t.name,t.email].filter(Boolean).some(x=>String(x).toLowerCase().includes(q));
-  }).map(row).join("") || '<tr><td colspan="11" class="muted">No tickets</td></tr>';
+  const rows = list
+    .map((t,i)=>({t,i}))
+    .filter(({t})=>{
+      const byStatus = currentStatus==="all" ? true : (String(t.status).toLowerCase()===currentStatus);
+      if (!byStatus) return false;
+      if (!q) return true;
+      return [t.ticket_id,t.order_name,t.order_id,t.name,t.email].filter(Boolean).some(x=>String(x).toLowerCase().includes(q));
+    })
+    .map(({t,i})=>row(t,i))
+    .join("") || '<tr><td colspan="8" class="muted">No tickets</td></tr>';
   $("#tbl tbody").innerHTML = rows;
 
+  /* Save buttons */
   $("#tbl").querySelectorAll(".save").forEach(btn=>{
     btn.onclick = async ()=>{
       const tr = btn.closest("tr");
@@ -739,6 +810,56 @@ function render(list){
     };
   });
 }
+
+/* Modal controls */
+function openModal(idx){
+  const t = cacheTickets[idx]; if(!t) return;
+  currentIdx = idx;
+  $("#m_title").textContent = \`\${t.ticket_id} — \${t.order_name||t.order_id||""}\`;
+  $("#m_order").value   = \`\${t.order_name||""} (ID:\${t.order_id||"-"})\`;
+  $("#m_ticket").value  = t.ticket_id||"";
+  $("#m_status").value  = t.status||"pending";
+  $("#m_name").value    = t.name||"";
+  $("#m_email").value   = t.email||"";
+  $("#m_phone").value   = t.phone||"";
+  $("#m_issue").value   = t.issue||"";
+  $("#m_message").value = t.message||"";
+  $("#m_created").value = fmt(t.created_at);
+  $("#m_updated").value = fmt(t.updated_at);
+  $("#modal").classList.add("show");
+  $("#modal").setAttribute("aria-hidden","false");
+}
+function closeModal(){
+  $("#modal").classList.remove("show");
+  $("#modal").setAttribute("aria-hidden","true");
+  currentIdx = -1;
+}
+$("#m_close").onclick = closeModal;
+$("#m_cancel").onclick = closeModal;
+$("#modal").addEventListener("click",(e)=>{ if(e.target===e.currentTarget) closeModal(); });
+document.addEventListener("keydown",(e)=>{ if(e.key==="Escape") closeModal(); });
+
+$("#m_save").onclick = async ()=>{
+  if(currentIdx<0) return;
+  const t = cacheTickets[currentIdx];
+  const status = $("#m_status").value;
+  const body = { order_id: t.order_id, ticket_id: t.ticket_id, status };
+  const r2 = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
+  const j2 = await r2.json().catch(()=>({ok:false,error:"bad_json"}));
+  if(!j2.ok) alert("Update failed: " + j2.error);
+  else { show("Updated"); closeModal(); load(); }
+};
+
+/* Delegated click on Ticket link -> open modal */
+$("#tbl").addEventListener("click",(e)=>{
+  const a = e.target.closest("a.tk");
+  if(!a) return;
+  e.preventDefault();
+  const idx = Number(a.dataset.i||-1);
+  openModal(idx);
+});
+
+/* Load */
 async function load(){
   $("#err").style.display="none";
   const qs = new URLSearchParams({
@@ -750,15 +871,19 @@ async function load(){
   if (r.status === 401) { $("#err").textContent="Auth required. Reload the page."; $("#err").style.display="block"; return; }
   const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
   if(!j.ok && !Array.isArray(j.tickets)){ $("#err").textContent = "Failed: " + (j.error||"unexpected"); $("#err").style.display="block"; $("#tbl tbody").innerHTML=""; return; }
-  const list = Array.isArray(j.tickets) ? j.tickets : j; // accept either {tickets:[]} or [] shape
+  const list = Array.isArray(j.tickets) ? j.tickets : j;
   cacheTickets = list || [];
   render(cacheTickets);
 }
+
+/* Events */
 $("#tabs").addEventListener("click",(e)=>{ const b=e.target.closest(".tab"); if(b) setActiveTab(b.dataset.status); });
 $("#st").onchange = ()=> setActiveTab($("#st").value);
 $("#go").onclick  = load;
 $("#clr").onclick = ()=>{ $("#st").value="all"; $("#since").value=""; $("#lim").value=200; $("#q").value=""; setActiveTab("all"); load(); };
 $("#q").oninput   = ()=> render(cacheTickets);
+
+/* Init */
 load();
 </script>
 </body>
