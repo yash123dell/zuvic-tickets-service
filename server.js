@@ -437,16 +437,33 @@ app.get("/admin/login", (req, res) => {
     </form>
   </div>
 <script nonce="${nonce}">
-const form=document.querySelector('form.card');
-form.addEventListener('submit', async (e)=>{
-  e.preventDefault();
-  const data=new FormData(form);
-  const r=await fetch('/admin/login',{method:'POST',body:data,credentials:'include'});
-  if(r.redirected){location.href=r.url;return;}
-  if(r.status===401){document.getElementById('err').style.display='block';return;}
-  try{const j=await r.json(); if(j.ok&&j.next){location.href=j.next;} else {document.getElementById('err').style.display='block';}}
-  catch{document.getElementById('err').style.display='block';}
-});
+  const form = document.querySelector('form.card');
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    // Convert FormData -> URL-encoded so Express can read it
+    const fd = new FormData(form);
+    const body = new URLSearchParams();
+    for (const [k, v] of fd) body.append(k, v);
+
+    const r = await fetch('/admin/login', {
+      method: 'POST',
+      body,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+      credentials: 'include'
+    });
+
+    if (r.redirected) { window.location = r.url; return; }
+    if (r.status === 401) { document.getElementById('err').style.display = 'block'; return; }
+
+    try {
+      const j = await r.json();
+      if (j.ok && j.next) window.location = j.next;
+      else document.getElementById('err').style.display = 'block';
+    } catch {
+      document.getElementById('err').style.display = 'block';
+    }
+  });
 </script>
 </body>
 </html>`);
