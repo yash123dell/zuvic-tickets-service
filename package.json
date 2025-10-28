@@ -1,18 +1,13 @@
 {
   "name": "zuvic-tickets-api",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
-  },
-  "engines": {
-    "node": ">=18 <21"
-  },
+  "engines": { "node": ">=18 <21" },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
-    "express": "^4.19.2"
-  },
-  "license": "UNLICENSED"
+    "express": "^4.19.2",
+    "cookie-parser": "^1.4.6",
+    "helmet": "^7.1.0",
+    "express-rate-limit": "^7.4.0"
+  }
 }
