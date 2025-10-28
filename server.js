@@ -3,7 +3,7 @@
 // SHOPIFY_ADMIN_TOKEN, SHOPIFY_SHOP, PROXY_SECRET
 // PROXY_MOUNT (default "/tickets")
 // SHOPIFY_API_VERSION or API_VERSION (fallback "2024-10")
-// ADMIN_UI_KEY      (Bearer for programmatic admin API)
+// ADMIN_UI_KEY      (Bearer for programmatic admin API; optional if using cookie login)
 // UI_USER, UI_PASS  (login form credentials for admin panel)
 // UI_SESSION_SECRET (signing key for admin UI cookie; defaults to ADMIN_UI_KEY or "change-me")
 // Optional: SKIP_PROXY_VERIFY=1 (skip App Proxy signature verification for local dev)
@@ -33,7 +33,7 @@ app.set("trust proxy", true);
 // --- middleware
 app.use(
   helmet({
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: false, // we set a tight CSP per-page below
     crossOriginResourcePolicy: { policy: "same-site" },
   })
 );
@@ -224,15 +224,27 @@ app.get(`${PROXY_MOUNT}/find-ticket`, async (req, res) => {
 });
 
 // ======================================================================
-// Admin (Bearer) API — programmatic (no Basic headers)
+// Admin (Bearer) API — programmatic
 // ======================================================================
 const ADMIN_UI_KEY = process.env.ADMIN_UI_KEY || "";
+
+/**
+ * Accept either:
+ *  - Bearer / X-Admin-UI-Key (automation/scripts)
+ *  - OR a valid ui_session cookie (human logged into /admin/login)
+ */
 function requireAdmin(req, res, next) {
   const bearer = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
   const xkey   = String(req.headers["x-admin-ui-key"] || "").trim();
-  if (ADMIN_UI_KEY && (bearer === ADMIN_UI_KEY || xkey === ADMIN_UI_KEY)) return next();
+  const cookieTok = req.cookies?.ui_session;
+
+  const hasKey = ADMIN_UI_KEY && (bearer === ADMIN_UI_KEY || xkey === ADMIN_UI_KEY);
+  const hasCookie = cookieTok && verifyToken(cookieTok);
+
+  if (hasKey || hasCookie) return next();
   return res.status(401).json({ ok:false, error:"unauthorized" });
 }
+
 app.use((req,res,next)=>{
   res.setHeader("Access-Control-Allow-Origin","*");
   res.setHeader("Access-Control-Allow-Headers","Content-Type, Authorization, X-Admin-UI-Key");
@@ -357,12 +369,12 @@ app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
     };
 
     const d2 = await adminGraphQL(`
-      mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
+      mutation Save($ownerId:ID!,$value:String!,$tid:String!,$st:String!){
         metafieldsSet(metafields:[
           { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
           { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
           { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st }
-        ]) { userErrors { field message } }
+        ]){ userErrors{ field message } }
       }`, { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: status });
 
     const err = d2?.metafieldsSet?.userErrors?.[0];
@@ -397,7 +409,8 @@ function requireUIAuth(req, res, next) {
 app.get("/admin/login", (req, res) => {
   const nonce = crypto.randomBytes(16).toString("base64");
   const next = (typeof req.query.next === "string" && req.query.next.startsWith("/")) ? req.query.next : "/admin/panel";
-  res.setHeader("Content-Security-Policy", `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'self'; frame-ancestors 'none'`);
+  res.setHeader("Content-Security-Policy",
+    `default-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-${nonce}'`);
   res.type("html").send(`<!doctype html>
 <html lang="en">
 <head>
@@ -440,22 +453,17 @@ app.get("/admin/login", (req, res) => {
   const form = document.querySelector('form.card');
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-
-    // Convert FormData -> URL-encoded so Express can read it
     const fd = new FormData(form);
     const body = new URLSearchParams();
     for (const [k, v] of fd) body.append(k, v);
-
     const r = await fetch('/admin/login', {
       method: 'POST',
       body,
       headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
       credentials: 'include'
     });
-
     if (r.redirected) { window.location = r.url; return; }
     if (r.status === 401) { document.getElementById('err').style.display = 'block'; return; }
-
     try {
       const j = await r.json();
       if (j.ok && j.next) window.location = j.next;
@@ -491,16 +499,164 @@ app.get("/admin/logout", (req, res) => {
 });
 
 // ----------------------------------------------------------------------
-// Admin Panel (requires cookie session)
-app.get("/admin/panel", requireUIAuth, (req, res) => {
-  const panelPath = path.join(__dirname, "public", "admin-panel.html");
-  if (fs.existsSync(panelPath)) return res.sendFile(panelPath);
-
+// Admin Panel (requires cookie session) — INLINE (no admin-panel.html)
+app.get("/admin/panel", requireUIAuth, (_req, res) => {
   const nonce = crypto.randomBytes(16).toString("base64");
-  res.setHeader("Content-Security-Policy", `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'self'; frame-ancestors 'none'`);
+  res.setHeader("Content-Security-Policy",
+    `default-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'self'; frame-ancestors 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-${nonce}'`);
+  res.type("html").send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ZUVIC • Support tickets</title>
+<style>
+  :root{--bg:#0b1220;--card:#0f172a;--fg:#e5e7eb;--muted:#94a3b8;--border:#1f2937;--primary:#1d4ed8;--ok:#16a34a;--warn:#d97706;--bad:#ef4444}
+  *{box-sizing:border-box} body{margin:0;background:#0b1220;color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  header{position:sticky;top:0;background:linear-gradient(180deg,#0f172a,#0f172aee);backdrop-filter:saturate(140%) blur(2px);border-bottom:1px solid var(--border);z-index:2}
+  .wrap{max-width:1100px;margin:0 auto;padding:18px}
+  h1{margin:0;font-size:18px}
+  .bar{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
+  select,input,button{height:36px;border-radius:10px;border:1px solid var(--border);background:#0b1220;color:var(--fg);padding:0 10px}
+  button{background:var(--primary);border:0;font-weight:600;cursor:pointer}
+  main{max-width:1100px;margin:18px auto;padding:0 18px}
+  table{width:100%;border-collapse:separate;border-spacing:0 8px}
+  th{color:var(--muted);text-align:left;font-weight:600;padding:6px 10px}
+  td{background:var(--card);border:1px solid var(--border);padding:10px;border-left-width:1px}
+  tr td:first-child{border-radius:12px 0 0 12px}
+  tr td:last-child{border-radius:0 12px 12px 0}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--border)}
+  .s-pending{background:#1f2937} .s-in_progress{background:#0b3b6c} .s-resolved{background:#0f5132} .s-closed{background:#3b3b3b}
+  .muted{color:var(--muted)} .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .right{justify-content:flex-end}
+  .rowflex{display:flex;gap:8px;align-items:center}
+  .danger{background:var(--bad)}
+  .ok{background:var(--ok)}
+  a{color:#93c5fd;text-decoration:none}
+  .empty{color:var(--muted);text-align:center;padding:40px 0}
+</style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <div class="rowflex" style="justify-content:space-between">
+        <h1>Support tickets</h1>
+        <div class="rowflex"><a href="/admin/logout">Logout</a></div>
+      </div>
+      <div class="bar">
+        <label>Status
+          <select id="fStatus">
+            <option value="all" selected>All</option>
+            <option value="pending">Pending</option>
+            <option value="in_progress">In progress</option>
+            <option value="resolved">Resolved</option>
+            <option value="closed">Closed</option>
+          </select>
+        </label>
+        <label>Since (ISO)
+          <input id="fSince" placeholder="YYYY-MM-DD or YYYY-MM-DDTHH:mm"/>
+        </label>
+        <label>Limit
+          <input id="fLimit" type="number" min="1" max="1000" value="200" style="width:90px"/>
+        </label>
+        <input id="fQuery" placeholder="Search order/ticket/email/phone" style="flex:1;min-width:220px"/>
+        <button id="btnRefresh">Refresh</button>
+      </div>
+    </div>
+  </header>
 
-  // (your existing inline admin panel HTML goes here — unchanged, including fixed esc() function)
-  res.type("html").send(`<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>ZUVIC • Support tickets</title></head><body><div style="padding:24px;font-family:system-ui">Admin panel bundled here… (keep your existing markup)</div></body></html>`);
+  <main>
+    <div id="mount"></div>
+  </main>
+
+<script nonce="${nonce}">
+  const STATUS = ["pending","in_progress","resolved","closed"];
+  const esc = (s)=>String(s??"").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const fmt = (s)=> s ? new Date(s).toLocaleString() : "";
+  const el = (h,cls)=>{ const x=document.createElement(h); if(cls) x.className=cls; return x; };
+
+  async function load(){
+    const status = document.getElementById('fStatus').value;
+    const since  = document.getElementById('fSince').value.trim();
+    const limit  = document.getElementById('fLimit').value || '200';
+    const qs = new URLSearchParams();
+    if (status && status !== 'all') qs.set('status', status);
+    if (since) qs.set('since', since);
+    if (limit) qs.set('limit', limit);
+    const r = await fetch('/admin/tickets?'+qs.toString(), { credentials:'include' });
+    const j = await r.json().catch(()=>({}));
+    if (!j.ok) throw new Error(j.error || 'Failed to load');
+    render(j.tickets || []);
+  }
+
+  function render(rows){
+    const q = document.getElementById('fQuery').value.toLowerCase().trim();
+    const mount = document.getElementById('mount'); mount.innerHTML = '';
+    if (!rows.length){
+      const d = el('div','empty'); d.textContent = 'No tickets found.'; mount.appendChild(d); return;
+    }
+    const table = el('table'); const thead = el('thead'); const trh = el('tr');
+    ['Order','Ticket','Status','Issue','Customer','Created','Updated','Actions'].forEach(h=>{ const th=el('th'); th.textContent=h; trh.appendChild(th); });
+    thead.appendChild(trh); table.appendChild(thead);
+    const tb = el('tbody');
+
+    rows.forEach(r=>{
+      // client-side search
+      const hay = (r.order_name+' '+r.ticket_id+' '+r.email+' '+r.phone+' '+r.issue+' '+r.message).toLowerCase();
+      if (q && !hay.includes(q)) return;
+
+      const tr=el('tr');
+
+      const td1=el('td'); td1.innerHTML = '<div class="mono">'+esc(r.order_name||('Order #'+r.order_id))+'</div><div class="muted">ID: '+esc(r.order_id)+'</div>';
+      const td2=el('td'); td2.innerHTML = '<div class="mono">'+esc(r.ticket_id)+'</div>'+(r.message?('<div class="muted">'+esc(r.message)+'</div>'):'');
+      const td3=el('td');
+        const sel=el('select'); sel.innerHTML = STATUS.map(s=>'<option value="'+s+'" '+(s===r.status?'selected':'')+'>'+s.replace('_',' ')+'</option>').join('');
+        td3.appendChild(sel);
+        const badge=el('span','badge s-'+r.status); badge.style.marginLeft='8px'; badge.textContent=r.status.replace('_',' ');
+        td3.appendChild(badge);
+        sel.addEventListener('change',()=>{ badge.className='badge s-'+sel.value; badge.textContent=sel.value.replace('_',' '); });
+
+      const td4=el('td'); td4.textContent = r.issue || '';
+      const td5=el('td'); td5.innerHTML = esc(r.name||'') + (r.email?(' · '+esc(r.email)):'') + (r.phone?(' · '+esc(r.phone)):'');
+      const td6=el('td'); td6.textContent = fmt(r.created_at);
+      const td7=el('td'); td7.textContent = fmt(r.updated_at);
+      const td8=el('td');
+        const btn=el('button'); btn.textContent='Save'; btn.addEventListener('click',()=>save(r.order_id, r.ticket_id, sel.value, tr, btn));
+        td8.appendChild(btn);
+
+      [td1,td2,td3,td4,td5,td6,td7,td8].forEach(td=>tr.appendChild(td));
+      tb.appendChild(tr);
+    });
+
+    table.appendChild(tb);
+    mount.appendChild(table);
+  }
+
+  async function save(order_id, ticket_id, status, tr, btn){
+    btn.disabled = true;
+    try{
+      const r = await fetch('/admin/tickets/update', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        credentials:'include',
+        body: JSON.stringify({ order_id, ticket_id, status })
+      });
+      const j = await r.json().catch(()=>({}));
+      if (!j.ok) throw new Error(j.error || 'Update failed');
+      tr.style.outline = '2px solid rgba(34,197,94,.6)';
+      setTimeout(()=>tr.style.outline='none', 800);
+    }catch(e){
+      alert(e.message || e);
+    }finally{
+      btn.disabled = false;
+    }
+  }
+
+  document.getElementById('btnRefresh').addEventListener('click', (e)=>{ e.preventDefault(); load(); });
+  load();
+</script>
+</body>
+</html>`);
 });
 
 // ----------------------------------------------------------------------
