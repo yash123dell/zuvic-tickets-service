@@ -508,18 +508,35 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   .chip.active{background:var(--primary);border-color:var(--primary);color:#fff}
   .chip .count{opacity:.9}
 
-  /* Filters */
-  .filters{display:grid;grid-template-columns:150px 160px 110px 1fr auto auto;gap:8px;margin-bottom:10px}
-  label{font-size:11px;color:var(--muted);display:grid;gap:5px}
+  /* Filters (global across pages) */
+  .filters{
+    display:grid;
+    grid-template-columns: minmax(130px,160px) minmax(140px,180px) minmax(90px,120px) 1fr auto auto;
+    gap:8px;
+    margin-bottom:10px;
+    align-items:end; /* align inputs + buttons on same baseline */
+  }
+  .filters > label{font-size:11px;color:var(--muted);display:grid;gap:5px;margin:0}
   select,input,button{height:34px;border:1px solid var(--border);border-radius:8px;background:#fff;color:#fff;font-size:13px}
   select,input{color:var(--fg);padding:0 10px}
+  .filters > button{align-self:end}      /* Refresh/Clear aligned */
   button.btn{border-color:var(--primary);background:var(--primary);color:#fff;cursor:pointer}
   button.ghost{background:#fff;color:#111}
 
-  /* Table (no horizontal scroll; actions fully visible) */
-  .table-wrap{border:1px solid var(--border);border-radius:12px;background:#fff}
+  /* Responsive filters */
+  @media (max-width: 900px){
+    .filters{grid-template-columns: 1fr 1fr 1fr; grid-auto-rows:minmax(34px,auto)}
+    .filters > button{justify-self:start}
+  }
+  @media (max-width: 600px){
+    .filters{grid-template-columns: 1fr; }
+    .filters > button{width:100%}
+  }
+
+  /* Table */
+  .table-wrap{border:1px solid var(--border);border-radius:12px;background:#fff;overflow-x:auto}
   table{width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed}
-  /* exact 100% */
+  /* desktop column widths add to 100% */
   col.order   {width:16%}
   col.ticket  {width:12%}
   col.status  {width:12%}
@@ -527,21 +544,43 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   col.customer{width:12%}
   col.when    {width:12%}
   col.when2   {width:12%}
-  col.actions {width:12%}
+  col.actions {width:12%} /* actions kept within table */
   thead th{position:sticky;top:0;background:#fafafa;z-index:2}
   th,td{padding:10px 12px;vertical-align:middle;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  /* Dividers */
   th+th, td+td{border-left:1px solid var(--border)}
   tbody tr+tr td{border-top:1px solid var(--border)}
 
   .order small{display:block;color:var(--muted);margin-top:2px}
   .pill{display:inline-block;padding:3px 9px;border-radius:999px;background:var(--pill);color:var(--pillfg);font-size:12px}
 
-  /* Actions column: never clipped */
+  /* Actions column — never hangs outside; wraps on small screens */
   td.actions{overflow:visible}
-  .actions-cell{display:flex;gap:8px;align-items:center;white-space:nowrap}
-  .actions-cell select{min-width:140px}
-  .save-btn{height:34px;border-radius:8px;background:var(--primary);color:#fff;border:0;padding:0 14px;cursor:pointer}
+  .actions-cell{
+    display:flex;
+    gap:8px;
+    align-items:center;
+    white-space:nowrap;
+    flex-wrap:wrap;           /* allow wrapping instead of overflowing */
+  }
+  .actions-cell select{
+    min-width:140px;
+    flex:1 1 140px;           /* grow/shrink but keep sensible min */
+  }
+  .save-btn{
+    height:34px;border-radius:8px;background:var(--primary);color:#fff;border:0;padding:0 14px;cursor:pointer;
+    flex:0 0 auto;
+  }
+
+  /* Tight screens: stack the select + save vertically to avoid overflow */
+  @media (max-width: 900px){
+    table{table-layout:auto}
+    colgroup col{width:auto !important}
+  }
+  @media (max-width: 600px){
+    .actions-cell{flex-direction:column; align-items:stretch}
+    .actions-cell select{width:100%}
+    .save-btn{width:100%}
+  }
 
   .muted{color:var(--muted)}
   .toast{position:fixed;right:14px;bottom:14px;background:#111827;color:#fff;padding:9px 11px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s}
@@ -686,7 +725,7 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   const $$ = (s)=>document.querySelectorAll(s);
   const esc = (v)=> String(v ?? "").replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   const fmt = (d)=> d ? new Date(d).toLocaleString() : "—";
-  const pill = (s)=> '<span class="pill">'+esc(String(s||"").replace("_"," "))+'</span>';
+  const pill = (s)=> '<span class="pill">'+esc(String(s||"").replace(/_/g," "))+'</span>';
   const show = (msg)=>{ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1100); };
 
   let currentStatus = "all";
@@ -882,7 +921,7 @@ app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
       order_name: prev.order_name || d1?.order?.name || "",
       created_at: prev.created_at || now,
       updated_at: now,
-      ...(reply !== undefined ? { admin_reply: reply } : {}) // store reply if provided
+      ...(reply !== undefined ? { admin_reply: reply } : {})
     };
 
     const d2 = await adminGraphQL(
