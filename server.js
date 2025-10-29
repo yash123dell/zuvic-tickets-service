@@ -494,6 +494,7 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  body.modal-open{overflow:hidden}
   a{color:#1d4ed8;text-decoration:none}
   .wrap{padding:20px 20px 32px}
   .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
@@ -510,9 +511,10 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   /* Filters */
   .filters{display:grid;grid-template-columns:150px 160px 110px 1fr auto auto;gap:8px;margin-bottom:10px}
   label{font-size:11px;color:var(--muted);display:grid;gap:5px}
-  select,input,button{height:34px;border:1px solid var(--border);border-radius:8px;background:#fff;color:var(--fg);padding:0 10px;font-size:13px}
+  select,input,button{height:34px;border:1px solid var(--border);border-radius:8px;background:#fff;color:#fff;font-size:13px}
+  select,input{color:var(--fg);padding:0 10px}
   button.btn{border-color:var(--primary);background:var(--primary);color:#fff;cursor:pointer}
-  button.ghost{background:#fff}
+  button.ghost{background:#fff;color:#111}
 
   /* Table (no horizontal scroll; actions fully visible) */
   .table-wrap{border:1px solid var(--border);border-radius:12px;background:#fff}
@@ -546,7 +548,7 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   .toast.show{opacity:1;transform:translateY(0)}
 
   /* Modal */
-  .overlay{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;padding:12px}
+  .overlay{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;padding:12px;z-index:9999}
   .overlay.show{display:flex}
   .modal{width:min(920px,96vw);background:#fff;border-radius:16px;border:1px solid var(--border);box-shadow:0 28px 70px rgba(0,0,0,.25)}
   .modal .head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border)}
@@ -778,6 +780,7 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
         $("#m_created").value= fmt(t.created_at);
         $("#m_updated").value= fmt(t.updated_at);
         $("#overlay").classList.add("show");
+        document.body.classList.add("modal-open");
       };
     });
   }
@@ -808,7 +811,7 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   $("#clr").onclick = ()=>{ $("#st").value="all"; $("#since").value=""; $("#lim").value=200; $("#q").value=""; currentStatus="all"; $$("#tabs .chip").forEach(x=>x.classList.toggle("active", x.dataset.status==="all")); load(); };
 
   // Modal buttons
-  const closeModal = ()=> $("#overlay").classList.remove("show");
+  const closeModal = ()=> { $("#overlay").classList.remove("show"); document.body.classList.remove("modal-open"); };
   $("#mclose").onclick = closeModal;
   $("#mx").onclick = closeModal;
   $("#overlay").addEventListener("click",(e)=>{ if(e.target.id==="overlay") closeModal(); });
@@ -879,7 +882,7 @@ app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
       order_name: prev.order_name || d1?.order?.name || "",
       created_at: prev.created_at || now,
       updated_at: now,
-      ...(reply !== undefined ? { admin_reply: reply } : {})  // <-- save reply if provided
+      ...(reply !== undefined ? { admin_reply: reply } : {}) // store reply if provided
     };
 
     const d2 = await adminGraphQL(
