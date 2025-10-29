@@ -504,7 +504,7 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
 
   /* Tabs */
   .tabs{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
-  .chip{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:999px;border:1px solid var(--border);background:#fff;cursor:pointer;font-size:13px}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:999px;border:1px solid var(--border);background:#1D4ED8;cursor:pointer;font-size:13px}
   .chip.active{background:var(--primary);border-color:var(--primary);color:#fff}
   .chip .count{opacity:.9}
 
