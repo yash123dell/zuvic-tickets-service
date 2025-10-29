@@ -855,6 +855,7 @@ app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
   try {
     const { order_id, ticket_id } = req.body || {};
     const status = normalizeStatus(req.body?.status || "pending");
+    const reply  = typeof req.body?.reply === "string" ? req.body.reply.slice(0, 4000) : undefined;
     if (!order_id || !ticket_id)
       return res.status(400).json({ ok: false, error: "missing order_id/ticket_id" });
 
@@ -870,13 +871,20 @@ app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
-    map[ticket_id] = { ...(prev||{}), ticket_id, status, order_id,
+    map[ticket_id] = {
+      ...(prev || {}),
+      ticket_id,
+      status,
+      order_id,
       order_name: prev.order_name || d1?.order?.name || "",
       created_at: prev.created_at || now,
-      updated_at: now };
+      updated_at: now,
+      ...(reply !== undefined ? { admin_reply: reply } : {})  // <-- save reply if provided
+    };
 
     const d2 = await adminGraphQL(
-      `mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
+      `
+      mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
         metafieldsSet(metafields:[
           { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
           { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
@@ -889,7 +897,7 @@ app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
     const err = d2?.metafieldsSet?.userErrors?.[0];
     if (err) throw new Error(err.message);
 
-    res.json({ ok:true, ticket: map[ticket_id] });
+    res.json({ ok: true, ticket: map[ticket_id] });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
