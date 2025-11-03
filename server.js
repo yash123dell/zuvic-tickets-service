@@ -462,7 +462,7 @@ function requireUIAuth(req, res, next) {
 // Rate limit login attempts
 const loginLimiter = rateLimit({ windowMs: 5 * 60_000, max: 30 });
 
-// Login page (GET)
+// Login page (GET) — minimal, premium, no eye/remember/back link
 app.get("/admin/login", (req, res) => {
   if (uiCookieValid(req)) return res.redirect("/admin/panel");
 
@@ -483,40 +483,50 @@ app.get("/admin/login", (req, res) => {
 <title>ZUVIC • Staff sign in</title>
 <style>
   :root{
-    --bg: #0f172a; --bg2:#111827; --card:#ffffff; --ink:#0f172a; --muted:#6b7280;
-    --brand:#1d4ed8; --brand2:#3b82f6; --line:#e5e7eb; --bad:#ef4444;
+    --bg:#0b1222; --bg2:#0e1a33; --card:#ffffff; --ink:#0f172a;
+    --muted:#6b7280; --brand:#2455f4; --brand2:#3b7bff; --line:#e5e7eb;
   }
   *{box-sizing:border-box}
-  body{margin:0;min-height:100vh;background:linear-gradient(135deg,var(--bg),var(--bg2));color:#fff;
-       font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
-  .wrap{width:min(440px,94vw);background:var(--card);color:var(--ink);
-        border-radius:20px;box-shadow:0 30px 80px rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08)}
-  .head{padding:26px 26px 8px}
-  .brand{display:flex;gap:10px;align-items:center}
-  .logo{width:34px;height:34px;display:grid;place-items:center;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;font-weight:800}
-  .title{font-size:18px;font-weight:700}
-  .body{padding:8px 26px 26px}
+  body{
+    margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px;
+    background:radial-gradient(1200px 600px at 50% 20%, #0f1b36 0%, var(--bg) 50%, var(--bg2) 100%);
+    font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; color:#fff;
+  }
+  .card{
+    width:min(440px,94vw);
+    background:var(--card); color:var(--ink);
+    border-radius:22px; border:1px solid rgba(255,255,255,.08);
+    box-shadow:0 40px 90px rgba(0,0,0,.45), 0 2px 0 rgba(0,0,0,.06) inset;
+    overflow:hidden;
+  }
+  .head{padding:28px 28px 6px}
+  .brand{display:flex;gap:12px;align-items:center}
+  .logo{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;
+        background:linear-gradient(135deg,var(--brand),var(--brand2)); color:#fff; font-weight:800}
+  .title{font-size:20px;font-weight:800}
+  .sub{font-size:12px;color:var(--muted)}
+  .body{padding:10px 28px 24px}
   label{font-size:12px;color:var(--muted);display:block;margin:14px 0 6px}
-  input[type="text"],input[type="password"]{width:100%;height:42px;border:1px solid var(--line);border-radius:12px;padding:0 12px;font-size:14px;outline:none}
-  .row{display:flex;justify-content:space-between;align-items:center;margin-top:10px}
-  .remember{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px}
-  .btn{width:100%;height:44px;margin-top:14px;border:0;border-radius:12px;background:var(--brand);color:#fff;font-weight:700;cursor:pointer}
+  input[type="text"], input[type="password"]{
+    width:100%; height:44px; border:1px solid var(--line); border-radius:12px; padding:0 12px; font-size:14px; outline:none;
+  }
+  .btn{
+    width:100%; height:46px; margin-top:16px; border:0; border-radius:12px;
+    background:linear-gradient(180deg,var(--brand),var(--brand2)); color:#fff; font-weight:800; cursor:pointer;
+  }
   .btn:active{transform:translateY(1px)}
   .err{margin-top:10px;color:#991b1b;background:#fee2e2;border:1px solid #fecaca;padding:10px;border-radius:10px;font-size:13px}
-  .foot{padding:14px 26px 24px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between}
-  a{color:var(--brand);text-decoration:none}
-  .pw{position:relative}
-  .toggle{position:absolute;right:10px;top:8px;border:0;background:transparent;color:var(--muted);cursor:pointer}
+  .foot{padding:14px 28px 26px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between}
 </style>
 </head>
 <body>
-  <form class="wrap" method="post" action="/admin/login">
+  <form class="card" method="post" action="/admin/login">
     <div class="head">
       <div class="brand">
         <div class="logo">Z</div>
         <div>
           <div class="title">Staff sign in</div>
-          <div style="font-size:12px;color:#6b7280">ZUVIC Support Admin</div>
+          <div class="sub">ZUVIC Support Admin</div>
         </div>
       </div>
     </div>
@@ -526,16 +536,12 @@ app.get("/admin/login", (req, res) => {
       <label>Username</label>
       <input name="username" type="text" autocomplete="username" spellcheck="false" required>
       <label>Password</label>
-      <div class="pw">
-        <input id="pw" name="password" type="password" autocomplete="current-password" required>
-        <button class="toggle" type="button" aria-label="Show password" onclick="(function(){var p=document.getElementById('pw');p.type=p.type==='password'?'text':'password';})();return false">👁</button>
-      </div>
-      <div class="row">
-        <label class="remember"><input type="checkbox" name="remember" value="1"> Remember me</label>
-        <a href="/" target="_blank" rel="noopener">Back to store</a>
-      </div>
+      <input name="password" type="password" autocomplete="current-password" required>
       <button class="btn" type="submit">Sign in</button>
-      <div class="foot"><span>© ${new Date().getFullYear()} ZUVIC</span><span>Secure area</span></div>
+    </div>
+    <div class="foot">
+      <span>© ${new Date().getFullYear()} ZUVIC</span>
+      <span>Secure area</span>
     </div>
   </form>
 </body>
@@ -547,7 +553,7 @@ app.post("/admin/login", loginLimiter, express.urlencoded({ extended: false }), 
   const nextPath = String(req.body.next || "/admin/panel");
   const user = String(req.body.username || "");
   const pass = String(req.body.password || "");
-  const remember = String(req.body.remember || "") === "1";
+  const remember = false; // always 12h session
 
   if (user === UI_USER && pass === UI_PASS) {
     const token = makeToken(remember ? 72 : 12); // 72h if remembered, else 12h
