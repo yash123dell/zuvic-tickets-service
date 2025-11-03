@@ -4,7 +4,7 @@
 // - PROXY_MOUNT (default "/tickets")
 // - SHOPIFY_API_VERSION or API_VERSION (fallback "2024-10")
 // - ADMIN_UI_KEY           (Bearer for programmatic admin API)
-// - UI_USER, UI_PASS       (basic-credentials for first HTML load)
+// - UI_USER, UI_PASS       (staff credentials for the HTML login)
 // - UI_SESSION_SECRET      (signing key for cookie; defaults to ADMIN_UI_KEY or "change-me")
 // Optional: SKIP_PROXY_VERIFY=1
 
@@ -419,62 +419,157 @@ app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
 });
 
 // ======================================================================
-// Admin Panel (Basic on first load → signed cookie; single-row tabs)
+// Admin UI (Branded login + cookie session + panel)
 // ======================================================================
 const UI_USER = process.env.UI_USER || "admin";
 const UI_PASS = process.env.UI_PASS || "change-me";
 const UI_SESSION_SECRET =
   process.env.UI_SESSION_SECRET || ADMIN_UI_KEY || "change-me";
 function sign(s) { return crypto.createHmac("sha256", UI_SESSION_SECRET).update(s).digest("hex"); }
-function makeToken(hours = 12) { const exp = Date.now() + hours * 3600 * 1000; const p = String(exp); return `${p}.${sign(p)}`; }
-function verifyToken(t){ if(!t) return false; const [exp,sig]=String(t).split("."); return (sig===sign(exp)) && (+exp > Date.now()); }
-function isSecure(req){ return (req.headers["x-forwarded-proto"] || req.protocol) === "https"; }
-
-// First load requires Basic, then we drop a cookie, so no popup afterwards
-function requireUIPassword(req, res, next) {
-  res.set("Cache-Control", "no-store, must-revalidate");
-  res.set("Pragma","no-cache");
-  const hdr = req.headers.authorization || "";
-  if (!hdr.startsWith("Basic ")) {
-    res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"');
-    return res.status(401).send("Auth required");
-  }
-  const [user, pass] = Buffer.from(hdr.split(" ")[1], "base64").toString("utf8").split(":");
-  if (user === UI_USER && pass === UI_PASS) {
-    const token = makeToken(12);
-    res.cookie("ui_session", token, { httpOnly:true, sameSite:"Strict", secure:isSecure(req), path:"/admin" });
-    return next();
-  }
-  res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"');
-  return res.status(401).send("Auth required");
+function makeToken(hours = 12) {
+  const exp = Date.now() + hours * 3600 * 1000;
+  const p = String(exp);
+  return `${p}.${sign(p)}`;
+}
+function verifyToken(t){
+  if(!t) return false;
+  const [exp,sig]=String(t).split(".");
+  return (sig===sign(exp)) && (+exp > Date.now());
+}
+function isSecure(req){
+  return (req.headers["x-forwarded-proto"] || req.protocol) === "https";
 }
 
-// Cookie OR Basic for XHR
-function requireUIAuth(req, res, next) {
+// Cookie helpers for UI
+function uiCookieValid(req) {
   const tok = req.cookies?.ui_session;
-  if (tok && verifyToken(tok)) return next();
-
-  const hdr = req.headers.authorization || "";
-  if (hdr.startsWith("Basic ")) {
-    const [user, pass] = Buffer.from(hdr.split(" ")[1], "base64").toString("utf8").split(":");
-    if (user === UI_USER && pass === UI_PASS) {
-      const token = makeToken(12);
-      res.cookie("ui_session", token, { httpOnly:true, sameSite:"Strict", secure:isSecure(req), path:"/admin" });
-      return next();
-    }
-  }
-  res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"');
-  return res.status(401).send("Auth required");
+  return tok && verifyToken(tok);
 }
 
+// For page routes: redirect to /admin/login if not signed in
+function requireUIPage(req, res, next) {
+  if (uiCookieValid(req)) return next();
+  const nextUrl = encodeURIComponent(req.originalUrl || "/admin/panel");
+  return res.redirect(`/admin/login?next=${nextUrl}`);
+}
+
+// For JSON/XHR routes: return JSON 401 if not signed in (no browser popup)
+function requireUIAuth(req, res, next) {
+  if (uiCookieValid(req)) return next();
+  return res.status(401).json({ ok: false, error: "unauthorized" });
+}
+
+// Rate limit login attempts
+const loginLimiter = rateLimit({ windowMs: 5 * 60_000, max: 30 });
+
+// Login page (GET)
+app.get("/admin/login", (req, res) => {
+  if (uiCookieValid(req)) return res.redirect("/admin/panel");
+
+  const nonce = crypto.randomBytes(16).toString("base64");
+  const err = String(req.query.err || "") === "1";
+  const nextPath = String(req.query.next || "/admin/panel");
+
+  res.setHeader(
+    "Content-Security-Policy",
+    `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'self'; frame-ancestors 'none'`
+  );
+
+  res.type("html").send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ZUVIC • Staff sign in</title>
+<style>
+  :root{
+    --bg: #0f172a; --bg2:#111827; --card:#ffffff; --ink:#0f172a; --muted:#6b7280;
+    --brand:#1d4ed8; --brand2:#3b82f6; --line:#e5e7eb; --bad:#ef4444;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;background:linear-gradient(135deg,var(--bg),var(--bg2));color:#fff;
+       font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
+  .wrap{width:min(440px,94vw);background:var(--card);color:var(--ink);
+        border-radius:20px;box-shadow:0 30px 80px rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08)}
+  .head{padding:26px 26px 8px}
+  .brand{display:flex;gap:10px;align-items:center}
+  .logo{width:34px;height:34px;display:grid;place-items:center;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;font-weight:800}
+  .title{font-size:18px;font-weight:700}
+  .body{padding:8px 26px 26px}
+  label{font-size:12px;color:var(--muted);display:block;margin:14px 0 6px}
+  input[type="text"],input[type="password"]{width:100%;height:42px;border:1px solid var(--line);border-radius:12px;padding:0 12px;font-size:14px;outline:none}
+  .row{display:flex;justify-content:space-between;align-items:center;margin-top:10px}
+  .remember{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px}
+  .btn{width:100%;height:44px;margin-top:14px;border:0;border-radius:12px;background:var(--brand);color:#fff;font-weight:700;cursor:pointer}
+  .btn:active{transform:translateY(1px)}
+  .err{margin-top:10px;color:#991b1b;background:#fee2e2;border:1px solid #fecaca;padding:10px;border-radius:10px;font-size:13px}
+  .foot{padding:14px 26px 24px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between}
+  a{color:var(--brand);text-decoration:none}
+  .pw{position:relative}
+  .toggle{position:absolute;right:10px;top:8px;border:0;background:transparent;color:var(--muted);cursor:pointer}
+</style>
+</head>
+<body>
+  <form class="wrap" method="post" action="/admin/login">
+    <div class="head">
+      <div class="brand">
+        <div class="logo">Z</div>
+        <div>
+          <div class="title">Staff sign in</div>
+          <div style="font-size:12px;color:#6b7280">ZUVIC Support Admin</div>
+        </div>
+      </div>
+    </div>
+    <div class="body">
+      ${err ? `<div class="err">Invalid username or password.</div>` : ``}
+      <input type="hidden" name="next" value="${nextPath}">
+      <label>Username</label>
+      <input name="username" type="text" autocomplete="username" spellcheck="false" required>
+      <label>Password</label>
+      <div class="pw">
+        <input id="pw" name="password" type="password" autocomplete="current-password" required>
+        <button class="toggle" type="button" aria-label="Show password" onclick="(function(){var p=document.getElementById('pw');p.type=p.type==='password'?'text':'password';})();return false">👁</button>
+      </div>
+      <div class="row">
+        <label class="remember"><input type="checkbox" name="remember" value="1"> Remember me</label>
+        <a href="/" target="_blank" rel="noopener">Back to store</a>
+      </div>
+      <button class="btn" type="submit">Sign in</button>
+      <div class="foot"><span>© ${new Date().getFullYear()} ZUVIC</span><span>Secure area</span></div>
+    </div>
+  </form>
+</body>
+</html>`);
+});
+
+// Login POST: set signed cookie and redirect
+app.post("/admin/login", loginLimiter, express.urlencoded({ extended: false }), (req, res) => {
+  const nextPath = String(req.body.next || "/admin/panel");
+  const user = String(req.body.username || "");
+  const pass = String(req.body.password || "");
+  const remember = String(req.body.remember || "") === "1";
+
+  if (user === UI_USER && pass === UI_PASS) {
+    const token = makeToken(remember ? 72 : 12); // 72h if remembered, else 12h
+    res.cookie("ui_session", token, {
+      httpOnly: true,
+      sameSite: "Strict",
+      secure: isSecure(req),
+      path: "/admin",
+    });
+    return res.redirect(nextPath);
+  }
+  return res.redirect(`/admin/login?err=1&next=${encodeURIComponent(nextPath)}`);
+});
+
+// Logout → back to login
 app.get("/admin/logout", (req, res) => {
   res.clearCookie("ui_session", { path: "/admin" });
-  res.set("WWW-Authenticate", 'Basic realm="Tickets Admin"');
-  res.status(401).send("Logged out");
+  return res.redirect("/admin/login");
 });
 
 // /admin/panel — full-width, no horizontal scroll, live updates + modal
-app.get("/admin/panel", requireUIPassword, (req, res) => {
+app.get("/admin/panel", requireUIPage, (req, res) => {
   const nonce = crypto.randomBytes(16).toString("base64");
   res.setHeader(
     "Content-Security-Policy",
@@ -514,16 +609,15 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
     grid-template-columns: minmax(130px,160px) minmax(140px,180px) minmax(90px,120px) 1fr auto auto;
     gap:8px;
     margin-bottom:10px;
-    align-items:end; /* align inputs + buttons on same baseline */
+    align-items:end;
   }
   .filters > label{font-size:11px;color:var(--muted);display:grid;gap:5px;margin:0}
   select,input,button{height:34px;border:1px solid var(--border);border-radius:8px;background:#fff;color:#fff;font-size:13px}
   select,input{color:var(--fg);padding:0 10px}
-  .filters > button{align-self:end}      /* Refresh/Clear aligned */
+  .filters > button{align-self:end}
   button.btn{border-color:var(--primary);background:var(--primary);color:#fff;cursor:pointer}
   button.ghost{background:#fff;color:#111}
 
-  /* Responsive filters */
   @media (max-width: 900px){
     .filters{grid-template-columns: 1fr 1fr 1fr; grid-auto-rows:minmax(34px,auto)}
     .filters > button{justify-self:start}
@@ -533,10 +627,8 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
     .filters > button{width:100%}
   }
 
-  /* Table */
   .table-wrap{border:1px solid var(--border);border-radius:12px;background:#fff;overflow-x:auto}
   table{width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed}
-  /* desktop column widths add to 100% */
   col.order   {width:16%}
   col.ticket  {width:12%}
   col.status  {width:12%}
@@ -544,7 +636,7 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   col.customer{width:12%}
   col.when    {width:12%}
   col.when2   {width:12%}
-  col.actions {width:12%} /* actions kept within table */
+  col.actions {width:12%}
   thead th{position:sticky;top:0;background:#fafafa;z-index:2}
   th,td{padding:10px 12px;vertical-align:middle;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   th+th, td+td{border-left:1px solid var(--border)}
@@ -553,25 +645,23 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   .order small{display:block;color:var(--muted);margin-top:2px}
   .pill{display:inline-block;padding:3px 9px;border-radius:999px;background:var(--pill);color:var(--pillfg);font-size:12px}
 
-  /* Actions column — never hangs outside; wraps on small screens */
   td.actions{overflow:visible}
   .actions-cell{
     display:flex;
     gap:8px;
     align-items:center;
     white-space:nowrap;
-    flex-wrap:wrap;           /* allow wrapping instead of overflowing */
+    flex-wrap:wrap;
   }
   .actions-cell select{
     min-width:140px;
-    flex:1 1 140px;           /* grow/shrink but keep sensible min */
+    flex:1 1 140px;
   }
   .save-btn{
     height:34px;border-radius:8px;background:var(--primary);color:#fff;border:0;padding:0 14px;cursor:pointer;
     flex:0 0 auto;
   }
 
-  /* Tight screens: stack the select + save vertically to avoid overflow */
   @media (max-width: 900px){
     table{table-layout:auto}
     colgroup col{width:auto !important}
@@ -586,7 +676,6 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   .toast{position:fixed;right:14px;bottom:14px;background:#111827;color:#fff;padding:9px 11px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s}
   .toast.show{opacity:1;transform:translateY(0)}
 
-  /* Modal */
   .overlay{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;padding:12px;z-index:9999}
   .overlay.show{display:flex}
   .modal{width:min(920px,96vw);background:#fff;border-radius:16px;border:1px solid var(--border);box-shadow:0 28px 70px rgba(0,0,0,.25)}
@@ -609,7 +698,6 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   </div>
 
   <div class="card">
-    <!-- Tabs -->
     <div class="tabs" id="tabs">
       <button class="chip active" data-status="all">All <span class="count" id="c_all">0</span></button>
       <button class="chip" data-status="pending">Pending <span class="count" id="c_pending">0</span></button>
@@ -618,7 +706,6 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
       <button class="chip" data-status="closed">Closed <span class="count" id="c_closed">0</span></button>
     </div>
 
-    <!-- Filters -->
     <div class="filters">
       <label>Status
         <select id="st">
@@ -642,7 +729,6 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
       <button id="clr" class="btn ghost" type="button">Clear</button>
     </div>
 
-    <!-- Table -->
     <div class="table-wrap">
       <table id="tbl">
         <colgroup>
@@ -661,7 +747,6 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   </div>
 </div>
 
-<!-- Modal -->
 <div id="overlay" class="overlay" role="dialog" aria-modal="true">
   <div class="modal">
     <div class="head">
@@ -669,12 +754,8 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
       <button id="mx" class="btn ghost" style="height:34px;border:1px solid var(--border);border-radius:8px">✕</button>
     </div>
     <div class="body">
-      <label>Ticket ID
-        <input id="m_tid" readonly>
-      </label>
-      <label>Order
-        <input id="m_order" readonly>
-      </label>
+      <label>Ticket ID <input id="m_tid" readonly></label>
+      <label>Order <input id="m_order" readonly></label>
       <label>Status
         <select id="m_status">
           <option value="pending">pending</option>
@@ -683,32 +764,14 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
           <option value="closed">closed</option>
         </select>
       </label>
-      <label>Issue
-        <input id="m_issue" readonly>
-      </label>
-      <label>Name
-        <input id="m_name" readonly>
-      </label>
-      <label>Email
-        <input id="m_email" readonly>
-      </label>
-      <label>Phone
-        <input id="m_phone" readonly>
-      </label>
-
-      <label>Message
-        <textarea id="m_message" readonly></textarea>
-      </label>
-      <label>Reply customer
-        <textarea id="m_reply" placeholder="Type your reply to customer… (optional)"></textarea>
-      </label>
-
-      <label>Created
-        <input id="m_created" readonly>
-      </label>
-      <label>Updated
-        <input id="m_updated" readonly>
-      </label>
+      <label>Issue   <input id="m_issue"  readonly></label>
+      <label>Name    <input id="m_name"   readonly></label>
+      <label>Email   <input id="m_email"  readonly></label>
+      <label>Phone   <input id="m_phone"  readonly></label>
+      <label>Message <textarea id="m_message" readonly></textarea></label>
+      <label>Reply customer <textarea id="m_reply" placeholder="Type your reply to customer… (optional)"></textarea></label>
+      <label>Created <input id="m_created" readonly></label>
+      <label>Updated <input id="m_updated" readonly></label>
     </div>
     <div class="foot">
       <button id="msave" class="btn primary">Save</button>
@@ -783,7 +846,6 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
     const rows = applyFilter(list).map(row).join("") || '<tr><td colspan="8" class="muted">No tickets</td></tr>';
     $("#tbl tbody").innerHTML = rows;
 
-    // Save (row)
     $("#tbl").querySelectorAll(".save").forEach(btn=>{
       btn.onclick = async ()=>{
         const tr = btn.closest("tr");
@@ -800,7 +862,6 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
       };
     });
 
-    // Open modal
     $("#tbl").querySelectorAll(".ticket-link").forEach(a=>{
       a.onclick = (e)=>{
         e.preventDefault();
@@ -836,7 +897,6 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
     render(cacheTickets);
   }
 
-  // Tabs & filters
   $("#tabs").addEventListener("click",(e)=>{
     const b = e.target.closest(".chip"); if(!b) return;
     currentStatus = b.dataset.status;
@@ -849,13 +909,11 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
   $("#go").onclick  = load;
   $("#clr").onclick = ()=>{ $("#st").value="all"; $("#since").value=""; $("#lim").value=200; $("#q").value=""; currentStatus="all"; $$("#tabs .chip").forEach(x=>x.classList.toggle("active", x.dataset.status==="all")); load(); };
 
-  // Modal buttons
   const closeModal = ()=> { $("#overlay").classList.remove("show"); document.body.classList.remove("modal-open"); };
   $("#mclose").onclick = closeModal;
   $("#mx").onclick = closeModal;
   $("#overlay").addEventListener("click",(e)=>{ if(e.target.id==="overlay") closeModal(); });
 
-  // Modal save (includes Reply)
   $("#msave").onclick = async ()=>{
     const tid = $("#m_tid").value;
     const t   = cacheTickets.find(x => String(x.ticket_id)===String(tid));
@@ -883,7 +941,7 @@ app.get("/admin/panel", requireUIPassword, (req, res) => {
 </html>`);
 });
 
-// Admin UI JSON for panel
+// Admin UI JSON for panel (cookie-guarded)
 app.get("/admin/ui/tickets", requireUIAuth, async (req, res) => {
   try {
     const { since, status = "all", limit = 200 } = req.query || {};
