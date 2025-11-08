@@ -70,6 +70,15 @@ function normalizeStatus(s) {
   return "all";
 }
 
+// NEW: hard-lock helpers
+function isClosed(s) {
+  return normalizeStatus(s) === "closed";
+}
+function truthy(v) {
+  const x = String(v ?? "").trim().toLowerCase();
+  return x === "1" || x === "true" || x === "yes";
+}
+
 // App Proxy signature helpers
 function expectedHmacFromReq(req, secret) {
   const rawQs = req.originalUrl.split("?")[1] || "";
@@ -135,6 +144,8 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
       name = "",
       order_name = "",
       created_at,
+      // NEW: explicit reopen flag allowed from storefront
+      reopen
     } = req.body || {};
 
     if (!order_id || !ticket_id) {
@@ -143,7 +154,6 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
         .json({ ok: false, error: "missing_fields", fields: ["order_id", "ticket_id"] });
     }
 
-    const st = normalizeStatus(status);
     const orderGid = `gid://shopify/Order/${String(order_id)}`;
 
     const d1 = await adminGraphQL(
@@ -159,6 +169,19 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
+    let st = normalizeStatus(status);
+
+    // NEW: Reopen rule — only customer via proxy can reopen closed
+    const wantsReopen =
+      truthy(reopen) || String(status || "").toLowerCase() === "reopen";
+
+    if (isClosed(prev.status)) {
+      if (!wantsReopen) {
+        return res.status(423).json({ ok: false, error: "ticket_closed_use_reopen" });
+      }
+      st = "pending"; // reopen → back to pending
+    }
+
     map[ticket_id] = {
       ticket_id,
       status: st,
@@ -171,6 +194,8 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
       order_name: order_name || d1?.order?.name || prev.order_name || "",
       created_at: prev.created_at || created_at || now,
       updated_at: now,
+      reopened_at: (isClosed(prev.status) && wantsReopen) ? now : (prev.reopened_at || undefined),
+      reopened_by: (isClosed(prev.status) && wantsReopen) ? "customer" : (prev.reopened_by || undefined),
     };
 
     const d2 = await adminGraphQL(
@@ -181,7 +206,7 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
           { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st }
         ]) { userErrors { field message } }
       }`,
-      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st }
+      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: st }
     );
 
     const err = d2?.metafieldsSet?.userErrors?.[0];
@@ -387,6 +412,12 @@ app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
+
+    // NEW: hard lock for admins
+    if (isClosed(prev.status)) {
+      return res.status(423).json({ ok:false, error:"ticket_closed_admin_locked" });
+    }
+
     map[ticket_id] = {
       ...(prev || {}),
       ticket_id,
@@ -462,7 +493,7 @@ function requireUIAuth(req, res, next) {
 // Rate limit login attempts
 const loginLimiter = rateLimit({ windowMs: 5 * 60_000, max: 30 });
 
-// Login page (GET) — minimal, premium, no eye/remember/back link
+// Login page (GET)
 app.get("/admin/login", (req, res) => {
   if (uiCookieValid(req)) return res.redirect("/admin/panel");
 
@@ -574,7 +605,7 @@ app.get("/admin/logout", (req, res) => {
   return res.redirect("/admin/login");
 });
 
-// /admin/panel — full-width, no horizontal scroll, live updates + modal
+// /admin/panel — full-width, live updates + modal
 app.get("/admin/panel", requireUIPage, (req, res) => {
   const nonce = crypto.randomBytes(16).toString("base64");
   res.setHeader(
@@ -603,13 +634,11 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
   .logout{color:var(--primary)}
   .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
 
-  /* Tabs */
   .tabs{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
   .chip{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:999px;border:1px solid var(--border);background:#1D4ED8;cursor:pointer;font-size:13px}
   .chip.active{background:var(--primary);border-color:var(--primary);color:#fff}
   .chip .count{opacity:.9}
 
-  /* Filters (global across pages) */
   .filters{
     display:grid;
     grid-template-columns: minmax(130px,160px) minmax(140px,180px) minmax(90px,120px) 1fr auto auto;
@@ -623,15 +652,6 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
   .filters > button{align-self:end}
   button.btn{border-color:var(--primary);background:var(--primary);color:#fff;cursor:pointer}
   button.ghost{background:#fff;color:#111}
-
-  @media (max-width: 900px){
-    .filters{grid-template-columns: 1fr 1fr 1fr; grid-auto-rows:minmax(34px,auto)}
-    .filters > button{justify-self:start}
-  }
-  @media (max-width: 600px){
-    .filters{grid-template-columns: 1fr; }
-    .filters > button{width:100%}
-  }
 
   .table-wrap{border:1px solid var(--border);border-radius:12px;background:#fff;overflow-x:auto}
   table{width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed}
@@ -813,8 +833,10 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
   }
 
   function row(t){
+    const locked = String(t.status||"").toLowerCase()==="closed";
     const order = orderCell(t);
     const ticketLink = '<a href="#" class="ticket-link" data-tid="'+esc(t.ticket_id)+'">'+esc(t.ticket_id)+'</a>';
+    const lockAttr = locked ? 'disabled title="Locked — customer can reopen from their account/ticket page"' : '';
     return \`<tr data-row="\${esc(t.ticket_id)}">
       <td>\${order}</td>
       <td>\${ticketLink}</td>
@@ -825,13 +847,13 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
       <td>\${fmt(t.updated_at)}</td>
       <td class="actions">
         <div class="actions-cell">
-          <select class="set">
+          <select class="set" \${lockAttr}>
             <option value="pending" \${t.status==="pending"?"selected":""}>pending</option>
             <option value="in_progress" \${t.status==="in_progress"?"selected":""}>in_progress</option>
             <option value="resolved" \${t.status==="resolved"?"selected":""}>resolved</option>
             <option value="closed" \${t.status==="closed"?"selected":""}>closed</option>
           </select>
-          <button class="save-btn save" data-oid="\${t.order_id}" data-tid="\${esc(t.ticket_id)}">Save</button>
+          <button class="save-btn save" data-oid="\${t.order_id}" data-tid="\${esc(t.ticket_id)}" \${lockAttr}>Save</button>
         </div>
       </td>
     </tr>\`;
@@ -854,10 +876,14 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
 
     $("#tbl").querySelectorAll(".save").forEach(btn=>{
       btn.onclick = async ()=>{
+        if (btn.hasAttribute("disabled")) {
+          return alert("This ticket is closed and locked. Only the customer can reopen.");
+        }
         const tr = btn.closest("tr");
         const status = tr.querySelector(".set").value;
         const body = { order_id: btn.dataset.oid, ticket_id: btn.dataset.tid, status };
         const r = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
+        if (r.status === 423) { alert("This ticket is closed and locked. Only the customer can reopen."); return; }
         const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
         if(!j.ok){ alert("Update failed: " + (j.error||"unexpected")); return; }
         const idx = cacheTickets.findIndex(x => String(x.ticket_id)===String(j.ticket.ticket_id));
@@ -873,7 +899,7 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
         e.preventDefault();
         const t = cacheTickets.find(x => String(x.ticket_id)===String(a.dataset.tid));
         if(!t) return;
-        $("#mh").textContent = "Ticket • " + t.ticket_id;
+        $("#mh").textContent = "Ticket • " + t.ticket_id + (String(t.status).toLowerCase()==="closed" ? " (locked)" : "");
         $("#m_tid").value = t.ticket_id || "";
         $("#m_order").value = (t.order_name || "") + (t.order_id ? "  (ID: "+t.order_id+")" : "");
         $("#m_status").value = t.status || "pending";
@@ -885,6 +911,12 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
         $("#m_reply").value  = t.admin_reply || "";
         $("#m_created").value= fmt(t.created_at);
         $("#m_updated").value= fmt(t.updated_at);
+
+        const locked = String(t.status||"").toLowerCase()==="closed";
+        $("#m_status").disabled  = locked;
+        $("#m_reply").disabled   = locked;
+        $("#msave").disabled     = locked;
+
         $("#overlay").classList.add("show");
         document.body.classList.add("modal-open");
       };
@@ -921,6 +953,9 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
   $("#overlay").addEventListener("click",(e)=>{ if(e.target.id==="overlay") closeModal(); });
 
   $("#msave").onclick = async ()=>{
+    if ($("#msave").disabled) {
+      return alert("This ticket is closed and locked. Only the customer can reopen.");
+    }
     const tid = $("#m_tid").value;
     const t   = cacheTickets.find(x => String(x.ticket_id)===String(tid));
     if(!t) return;
@@ -930,7 +965,12 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
       status: $("#m_status").value,
       reply:  $("#m_reply").value
     };
+    if (String(body.status).toLowerCase()==="closed") {
+      // saving a closed ticket is a no-op — block
+      return alert("This ticket is closed and locked. Only the customer can reopen.");
+    }
     const r = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
+    if (r.status === 423) { alert("This ticket is closed and locked. Only the customer can reopen."); return; }
     const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
     if(!j.ok){ alert("Update failed: " + (j.error||"unexpected")); return; }
     const idx = cacheTickets.findIndex(x => String(x.ticket_id)===String(j.ticket.ticket_id));
@@ -977,6 +1017,12 @@ app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
 
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
+
+    // NEW: hard lock for UI/Admin
+    if (isClosed(prev.status)) {
+      return res.status(423).json({ ok:false, error:"ticket_closed_admin_locked" });
+    }
+
     map[ticket_id] = {
       ...(prev || {}),
       ticket_id,
