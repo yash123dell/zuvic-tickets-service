@@ -63,10 +63,12 @@ const SKIP_VERIFY = process.env.SKIP_PROXY_VERIFY === "1";
 // ---------- utils
 app.get("/healthz", (_req, res) => res.type("text").send("ok"));
 
+// STATUS: no "resolved" for admins/UI. Legacy "resolved" → "in_progress".
 function normalizeStatus(s) {
-  const v = String(s || "").toLowerCase();
+  const v = String(s || "").toLowerCase().trim();
   if (v === "in progress" || v === "processing") return "in_progress";
-  if (["pending", "in_progress", "resolved", "closed", "all"].includes(v)) return v;
+  if (v === "resolved") return "in_progress";               // legacy map
+  if (["pending", "in_progress", "closed", "all"].includes(v)) return v;
   return "all";
 }
 
@@ -171,7 +173,7 @@ app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
     const prev = map[ticket_id] || {};
     let st = normalizeStatus(status);
 
-    // NEW: Reopen rule — only customer via proxy can reopen closed
+    // Reopen rule — only customer via proxy can reopen closed
     const wantsReopen =
       truthy(reopen) || String(status || "").toLowerCase() === "reopen";
 
@@ -413,7 +415,7 @@ app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
 
-    // NEW: hard lock for admins
+    // HARD LOCK for admins: cannot update once closed
     if (isClosed(prev.status)) {
       return res.status(423).json({ ok:false, error:"ticket_closed_admin_locked" });
     }
@@ -605,7 +607,7 @@ app.get("/admin/logout", (req, res) => {
   return res.redirect("/admin/login");
 });
 
-// /admin/panel — full-width, live updates + modal
+// /admin/panel — full-width, live updates + modal (NO "resolved")
 app.get("/admin/panel", requireUIPage, (req, res) => {
   const nonce = crypto.randomBytes(16).toString("base64");
   res.setHeader(
@@ -728,7 +730,6 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
       <button class="chip active" data-status="all">All <span class="count" id="c_all">0</span></button>
       <button class="chip" data-status="pending">Pending <span class="count" id="c_pending">0</span></button>
       <button class="chip" data-status="in_progress">In progress <span class="count" id="c_in_progress">0</span></button>
-      <button class="chip" data-status="resolved">Resolved <span class="count" id="c_resolved">0</span></button>
       <button class="chip" data-status="closed">Closed <span class="count" id="c_closed">0</span></button>
     </div>
 
@@ -738,7 +739,6 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
           <option value="all">all</option>
           <option value="pending">pending</option>
           <option value="in_progress">in_progress</option>
-          <option value="resolved">resolved</option>
           <option value="closed">closed</option>
         </select>
       </label>
@@ -786,7 +786,6 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
         <select id="m_status">
           <option value="pending">pending</option>
           <option value="in_progress">in_progress</option>
-          <option value="resolved">resolved</option>
           <option value="closed">closed</option>
         </select>
       </label>
@@ -821,9 +820,9 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
   let cacheTickets  = [];
 
   function counts(list){
-    const c = { all:list.length, pending:0, in_progress:0, resolved:0, closed:0 };
+    const c = { all:list.length, pending:0, in_progress:0, closed:0 };
     list.forEach(t => { const s=(t.status||"pending").toLowerCase(); if (c[s]!=null) c[s]++; });
-    $("#c_all").textContent=c.all; $("#c_pending").textContent=c.pending; $("#c_in_progress").textContent=c.in_progress; $("#c_resolved").textContent=c.resolved; $("#c_closed").textContent=c.closed;
+    $("#c_all").textContent=c.all; $("#c_pending").textContent=c.pending; $("#c_in_progress").textContent=c.in_progress; $("#c_closed").textContent=c.closed;
   }
 
   function orderCell(t){
@@ -850,7 +849,6 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
           <select class="set" \${lockAttr}>
             <option value="pending" \${t.status==="pending"?"selected":""}>pending</option>
             <option value="in_progress" \${t.status==="in_progress"?"selected":""}>in_progress</option>
-            <option value="resolved" \${t.status==="resolved"?"selected":""}>resolved</option>
             <option value="closed" \${t.status==="closed"?"selected":""}>closed</option>
           </select>
           <button class="save-btn save" data-oid="\${t.order_id}" data-tid="\${esc(t.ticket_id)}" \${lockAttr}>Save</button>
@@ -966,8 +964,8 @@ app.get("/admin/panel", requireUIPage, (req, res) => {
       reply:  $("#m_reply").value
     };
     if (String(body.status).toLowerCase()==="closed") {
-      // saving a closed ticket is a no-op — block
-      return alert("This ticket is closed and locked. Only the customer can reopen.");
+      // saving a closed ticket is a no-op — block via server too
+      // (client guard helps UX)
     }
     const r = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
     if (r.status === 423) { alert("This ticket is closed and locked. Only the customer can reopen."); return; }
@@ -1018,7 +1016,7 @@ app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
     const now = new Date().toISOString();
     const prev = map[ticket_id] || {};
 
-    // NEW: hard lock for UI/Admin
+    // HARD LOCK for UI/Admin: cannot update once closed
     if (isClosed(prev.status)) {
       return res.status(423).json({ ok:false, error:"ticket_closed_admin_locked" });
     }
