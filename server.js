@@ -1,1059 +1,2161 @@
-// server.js
-// ENVs:
-// - SHOPIFY_ADMIN_TOKEN, SHOPIFY_SHOP, PROXY_SECRET
-// - PROXY_MOUNT (default "/tickets")
-// - SHOPIFY_API_VERSION or API_VERSION (fallback "2024-10")
-// - ADMIN_UI_KEY           (Bearer for programmatic admin API)
-// - UI_USER, UI_PASS       (staff credentials for the HTML login)
-// - UI_SESSION_SECRET      (signing key for cookie; defaults to ADMIN_UI_KEY or "change-me")
-// Optional: SKIP_PROXY_VERIFY=1
+{% comment %}theme-check-disable TemplateLength{% endcomment %}
 
-import express from "express";
-import crypto from "crypto";
-import path from "path";
-import fs from "fs";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
-import cookieParser from "cookie-parser";
-import { fileURLToPath } from "url";
+{{ 'section-main-product.css' | asset_url | stylesheet_tag }}
+{{ 'section-main-product-added.css' | asset_url | stylesheet_tag }}
+{{ 'component-accordion.css' | asset_url | stylesheet_tag }}
+{{ 'component-slider.css' | asset_url | stylesheet_tag }}
+{{ 'component-price.css' | asset_url | stylesheet_tag }}
+{{ 'component-rte.css' | asset_url | stylesheet_tag }}
+{{ 'component-rating.css' | asset_url | stylesheet_tag }}
+{{ 'breadcrumb-nav.css' | asset_url | stylesheet_tag }}
+{{ 'product-form-input.css' | asset_url | stylesheet_tag }}
+{{ 'dynamic-checkout.css' | asset_url | stylesheet_tag }}
 
-// Polyfill fetch if running on a Node build without global fetch
-if (!globalThis.fetch) {
-  const { default: nodeFetch } = await import("node-fetch");
-  globalThis.fetch = nodeFetch;
-}
+<link rel="stylesheet" href="{{ 'component-deferred-media.css' | asset_url }}" media="print" onload="this.media='all'">
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const app = express();
-app.disable("x-powered-by");
-app.set("trust proxy", true);
-
-// ---------- middleware
-app.use(
-  helmet({
-    contentSecurityPolicy: false,
-    crossOriginResourcePolicy: { policy: "same-site" },
-  })
-);
-app.use(rateLimit({ windowMs: 60_000, max: 180 }));
-app.use(cookieParser());
-app.use(express.json({ limit: "512kb" }));
-app.use(express.urlencoded({ extended: false }));
-app.use(
-  express.static(path.join(__dirname, "public"), {
-    setHeaders(res) {
-      res.setHeader("Cache-Control", "no-store, must-revalidate");
-      res.setHeader("Pragma", "no-cache");
-    },
-  })
-);
-
-// ---------- env
-const PORT = process.env.PORT || 3000;
-const PROXY_MOUNT = process.env.PROXY_MOUNT || "/tickets";
-const PROXY_SECRET = process.env.PROXY_SECRET || "";
-const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP || ""; // e.g. zuvic-in.myshopify.com
-const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || "";
-const API_VERSION =
-  process.env.SHOPIFY_API_VERSION || process.env.API_VERSION || "2024-10";
-const SKIP_VERIFY = process.env.SKIP_PROXY_VERIFY === "1";
-
-// ---------- utils
-app.get("/healthz", (_req, res) => res.type("text").send("ok"));
-
-// STATUS: no "resolved" for admins/UI. Legacy "resolved" → "in_progress".
-function normalizeStatus(s) {
-  const v = String(s || "").toLowerCase().trim();
-  if (v === "in progress" || v === "processing") return "in_progress";
-  if (v === "resolved") return "in_progress";               // legacy map
-  if (["pending", "in_progress", "closed", "all"].includes(v)) return v;
-  return "all";
-}
-
-// NEW: hard-lock helpers
-function isClosed(s) {
-  return normalizeStatus(s) === "closed";
-}
-function truthy(v) {
-  const x = String(v ?? "").trim().toLowerCase();
-  return x === "1" || x === "true" || x === "yes";
-}
-
-// App Proxy signature helpers
-function expectedHmacFromReq(req, secret) {
-  const rawQs = req.originalUrl.split("?")[1] || "";
-  const usp = new URLSearchParams(rawQs);
-  const pairs = [];
-  for (const [k, v] of usp) if (k !== "signature") pairs.push([k, v]);
-  pairs.sort((a, b) =>
-    a[0] === b[0]
-      ? String(a[1]).localeCompare(String(b[1]))
-      : a[0].localeCompare(b[0])
-  );
-  const msg = pairs.map(([k, v]) => `${k}=${v}`).join("");
-  return crypto.createHmac("sha256", secret).update(msg).digest("hex");
-}
-function verifyProxySignature(req) {
-  if (SKIP_VERIFY) return true;
-  const provided = String(req.query.signature || "").toLowerCase();
-  if (!PROXY_SECRET || !provided) return false;
-  const expected = expectedHmacFromReq(req, PROXY_SECRET).toLowerCase();
-  const a = Buffer.from(provided, "utf8");
-  const b = Buffer.from(expected, "utf8");
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
-// Shopify Admin GraphQL helper
-async function adminGraphQL(query, variables = {}) {
-  if (!SHOPIFY_SHOP || !ADMIN_TOKEN) {
-    throw new Error("Missing SHOPIFY_SHOP or SHOPIFY_ADMIN_TOKEN");
-  }
-  const url = `https://${SHOPIFY_SHOP}/admin/api/${API_VERSION}/graphql.json`;
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": ADMIN_TOKEN,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-  const body = await r.json().catch(() => ({}));
-  if (!r.ok || body.errors) {
-    const msg = body?.errors?.[0]?.message || r.statusText;
-    throw new Error(`[AdminGraphQL] ${r.status} ${msg}`);
-  }
-  return body.data;
-}
-
-// ======================================================================
-// App Proxy endpoints (storefront)
-// ======================================================================
-app.post(`${PROXY_MOUNT}/attach-ticket`, async (req, res) => {
-  try {
-    if (!verifyProxySignature(req))
-      return res.status(401).json({ ok: false, error: "invalid_signature" });
-
-    const {
-      order_id,
-      ticket_id,
-      status = "pending",
-      issue = "",
-      message = "",
-      phone = "",
-      email = "",
-      name = "",
-      order_name = "",
-      created_at,
-      // NEW: explicit reopen flag allowed from storefront
-      reopen
-    } = req.body || {};
-
-    if (!order_id || !ticket_id) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "missing_fields", fields: ["order_id", "ticket_id"] });
-    }
-
-    const orderGid = `gid://shopify/Order/${String(order_id)}`;
-
-    const d1 = await adminGraphQL(
-      `query GetOrder($id: ID!) { order(id: $id) { id name tickets: metafield(namespace:"support", key:"tickets"){ id value } } }`,
-      { id: orderGid }
-    );
-
-    let map = {};
-    const mf = d1?.order?.tickets;
-    if (mf?.value) {
-      try { map = JSON.parse(mf.value); } catch { map = {}; }
-    }
-
-    const now = new Date().toISOString();
-    const prev = map[ticket_id] || {};
-    let st = normalizeStatus(status);
-
-    // Reopen rule — only customer via proxy can reopen closed
-    const wantsReopen =
-      truthy(reopen) || String(status || "").toLowerCase() === "reopen";
-
-    if (isClosed(prev.status)) {
-      if (!wantsReopen) {
-        return res.status(423).json({ ok: false, error: "ticket_closed_use_reopen" });
-      }
-      st = "pending"; // reopen → back to pending
-    }
-
-    map[ticket_id] = {
-      ticket_id,
-      status: st,
-      issue: issue || prev.issue || "",
-      message: message || prev.message || "",
-      phone: phone || prev.phone || "",
-      email: email || prev.email || "",
-      name: name || prev.name || "",
-      order_id,
-      order_name: order_name || d1?.order?.name || prev.order_name || "",
-      created_at: prev.created_at || created_at || now,
-      updated_at: now,
-      reopened_at: (isClosed(prev.status) && wantsReopen) ? now : (prev.reopened_at || undefined),
-      reopened_by: (isClosed(prev.status) && wantsReopen) ? "customer" : (prev.reopened_by || undefined),
-    };
-
-    const d2 = await adminGraphQL(
-      `mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
-        metafieldsSet(metafields:[
-          { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
-          { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
-          { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st }
-        ]) { userErrors { field message } }
-      }`,
-      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: st }
-    );
-
-    const err = d2?.metafieldsSet?.userErrors?.[0];
-    if (err) throw new Error(err.message);
-
-    res.json({ ok: true, ticket: map[ticket_id] });
-  } catch (e) {
-    console.error("[attach-ticket]", e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-app.get(`${PROXY_MOUNT}/find-ticket`, async (req, res) => {
-  try {
-    if (!verifyProxySignature(req))
-      return res.status(401).json({ ok: false, error: "invalid_signature" });
-
-    const ticket_id = String(req.query.ticket_id || "").trim();
-    const order_id = String(req.query.order_id || "").trim();
-    if (!ticket_id) return res.status(400).json({ ok: false, error: "missing ticket_id" });
-    if (!order_id) return res.status(400).json({ ok: false, error: "missing order_id" });
-
-    const orderGid = `gid://shopify/Order/${order_id}`;
-    const d = await adminGraphQL(
-      `query GetOrderForTicket($id: ID!) {
-        order(id: $id) {
-          id name createdAt
-          tickets: metafield(namespace:"support", key:"tickets"){ value }
-          tId:     metafield(namespace:"support", key:"ticket_id"){ value }
-          tStatus: metafield(namespace:"support", key:"ticket_status"){ value }
-        }
-      }`,
-      { id: orderGid }
-    );
-
-    const order = d?.order;
-    if (!order) return res.json({ ok: false, error: "order_not_found" });
-
-    let ticket = null, status = null;
-
-    const json = order.tickets?.value;
-    if (json) try {
-      const map = JSON.parse(json);
-      if (map && map[ticket_id]) { ticket = map[ticket_id]; status = ticket.status || null; }
-    } catch {}
-
-    if (!ticket && order.tId?.value === ticket_id) {
-      ticket = { ticket_id, status: order.tStatus?.value || "pending" };
-      status = ticket.status;
-    }
-
-    if (!ticket) return res.json({ ok: false, error: "ticket_not_found" });
-
-    res.json({
-      ok: true,
-      ticket,
-      status: status || "pending",
-      order_id,
-      order_name: order.name,
-      order_created_at: order.createdAt,
-    });
-  } catch (e) {
-    console.error("[find-ticket]", e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// ======================================================================
-// Admin (programmatic) API
-// ======================================================================
-const ADMIN_UI_KEY = process.env.ADMIN_UI_KEY || "";
-function requireAdmin(req, res, next) {
-  const bearer = String(req.headers.authorization || "")
-    .replace(/^Bearer\s+/i, "")
-    .trim();
-  const xkey = String(req.headers["x-admin-ui-key"] || "").trim();
-  if (ADMIN_UI_KEY && (bearer === ADMIN_UI_KEY || xkey === ADMIN_UI_KEY)) return next();
-  return res.status(401).json({ ok: false, error: "unauthorized" });
-}
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-UI-Key");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
-async function collectTickets({ since, status, limit = 200 }) {
-  const out = [];
-  let after = null;
-  const max = Math.min(Number(limit || 200), 1000);
-  const shopQuery = since ? `updated_at:>=${since}` : null;
-
-  while (out.length < max) {
-    const data = await adminGraphQL(
-      `query Orders($first:Int!,$after:String,$query:String){
-        orders(first:$first, after:$after, query:$query, sortKey:UPDATED_AT, reverse:true){
-          edges{
-            cursor
-            node{
-              id name createdAt updatedAt
-              mfJSON: metafield(namespace:"support", key:"tickets"){ value }
-              mfId:   metafield(namespace:"support", key:"ticket_id"){ value }
-              mfSt:   metafield(namespace:"support", key:"ticket_status"){ value }
-            }
-          }
-          pageInfo{ hasNextPage }
-        }
-      }`,
-      { first: 50, after, query: shopQuery }
-    );
-
-    const edges = data?.orders?.edges || [];
-    if (!edges.length) break;
-
-    for (const { cursor, node } of edges) {
-      const orderId = Number(String(node.id).split("/").pop());
-      const base = {
-        order_id: orderId,
-        order_name: node.name,
-        order_created_at: node.createdAt,
-        order_updated_at: node.updatedAt,
-      };
-
-      let map = {};
-      const raw = node.mfJSON?.value;
-      if (raw) { try { map = JSON.parse(raw); } catch {} }
-
-      if (Object.keys(map).length) {
-        for (const [key, t] of Object.entries(map)) {
-          const rec = {
-            ...base,
-            ticket_id: t.ticket_id || key,
-            status: normalizeStatus(t.status) || "pending",
-            issue: t.issue || "",
-            message: t.message || "",
-            phone: t.phone || "",
-            email: t.email || "",
-            name: t.name || "",
-            created_at: t.created_at || base.order_created_at,
-            updated_at: t.updated_at || base.order_updated_at,
-          };
-          if (!status || status === "all" || rec.status === normalizeStatus(status)) {
-            out.push(rec);
-            if (out.length >= max) break;
-          }
-        }
-      } else if (node.mfId?.value) {
-        const rec = {
-          ...base,
-          ticket_id: node.mfId.value,
-          status: normalizeStatus(node.mfSt?.value || "pending"),
-          issue: "",
-          message: "",
-          phone: "",
-          email: "",
-          name: "",
-          created_at: base.order_created_at,
-          updated_at: base.order_updated_at,
-        };
-        if (!status || status === "all" || rec.status === normalizeStatus(status)) out.push(rec);
-      }
-      if (out.length >= max) break;
-      after = cursor;
-    }
-    if (!data?.orders?.pageInfo?.hasNextPage) break;
-  }
-
-  return out.slice(0, max);
-}
-
-app.get("/admin/tickets", requireAdmin, async (req, res) => {
-  try {
-    const { since, status, limit } = req.query || {};
-    const tickets = await collectTickets({
-      since,
-      status: normalizeStatus(status),
-      limit,
-    });
-    res.json({ ok: true, count: tickets.length, tickets });
-  } catch (e) {
-    console.error("GET /admin/tickets", e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-app.post("/admin/tickets/update", requireAdmin, async (req, res) => {
-  try {
-    const { order_id, ticket_id } = req.body || {};
-    const status = normalizeStatus(req.body?.status || "pending");
-    if (!order_id || !ticket_id)
-      return res.status(400).json({ ok: false, error: "missing order_id/ticket_id" });
-
-    const orderGid = `gid://shopify/Order/${order_id}`;
-    const d1 = await adminGraphQL(
-      `query GetOrder($id:ID!){ order(id:$id){ name metafield(namespace:"support", key:"tickets"){ value } } }`,
-      { id: orderGid }
-    );
-
-    let map = {};
-    const raw = d1?.order?.metafield?.value;
-    if (raw) { try { map = JSON.parse(raw); } catch {} }
-
-    const now = new Date().toISOString();
-    const prev = map[ticket_id] || {};
-
-    // HARD LOCK for admins: cannot update once closed
-    if (isClosed(prev.status)) {
-      return res.status(423).json({ ok:false, error:"ticket_closed_admin_locked" });
-    }
-
-    map[ticket_id] = {
-      ...(prev || {}),
-      ticket_id,
-      status,
-      order_id,
-      order_name: prev.order_name || d1?.order?.name || "",
-      created_at: prev.created_at || now,
-      updated_at: now,
-    };
-
-    const d2 = await adminGraphQL(
-      `mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
-        metafieldsSet(metafields:[
-          { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
-          { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
-          { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st }
-        ]) { userErrors { field message } }
-      }`,
-      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: status }
-    );
-
-    const err = d2?.metafieldsSet?.userErrors?.[0];
-    if (err) throw new Error(err.message);
-
-    res.json({ ok: true, ticket: map[ticket_id] });
-  } catch (e) {
-    console.error("POST /admin/tickets/update", e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// ======================================================================
-// Admin UI (Branded login + cookie session + panel)
-// ======================================================================
-const UI_USER = process.env.UI_USER || "admin";
-const UI_PASS = process.env.UI_PASS || "change-me";
-const UI_SESSION_SECRET =
-  process.env.UI_SESSION_SECRET || ADMIN_UI_KEY || "change-me";
-function sign(s) { return crypto.createHmac("sha256", UI_SESSION_SECRET).update(s).digest("hex"); }
-function makeToken(hours = 12) {
-  const exp = Date.now() + hours * 3600 * 1000;
-  const p = String(exp);
-  return `${p}.${sign(p)}`;
-}
-function verifyToken(t){
-  if(!t) return false;
-  const [exp,sig]=String(t).split(".");
-  return (sig===sign(exp)) && (+exp > Date.now());
-}
-function isSecure(req){
-  return (req.headers["x-forwarded-proto"] || req.protocol) === "https";
-}
-
-// Cookie helpers for UI
-function uiCookieValid(req) {
-  const tok = req.cookies?.ui_session;
-  return tok && verifyToken(tok);
-}
-
-// For page routes: redirect to /admin/login if not signed in
-function requireUIPage(req, res, next) {
-  if (uiCookieValid(req)) return next();
-  const nextUrl = encodeURIComponent(req.originalUrl || "/admin/panel");
-  return res.redirect(`/admin/login?next=${nextUrl}`);
-}
-
-// For JSON/XHR routes: return JSON 401 if not signed in (no browser popup)
-function requireUIAuth(req, res, next) {
-  if (uiCookieValid(req)) return next();
-  return res.status(401).json({ ok: false, error: "unauthorized" });
-}
-
-// Rate limit login attempts
-const loginLimiter = rateLimit({ windowMs: 5 * 60_000, max: 30 });
-
-// Login page (GET)
-app.get("/admin/login", (req, res) => {
-  if (uiCookieValid(req)) return res.redirect("/admin/panel");
-
-  const nonce = crypto.randomBytes(16).toString("base64");
-  const err = String(req.query.err || "") === "1";
-  const nextPath = String(req.query.next || "/admin/panel");
-
-  res.setHeader(
-    "Content-Security-Policy",
-    `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'self'; frame-ancestors 'none'`
-  );
-
-  res.type("html").send(`<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>ZUVIC • Staff sign in</title>
 <style>
-  :root{
-    --bg:#0b1222; --bg2:#0e1a33; --card:#ffffff; --ink:#0f172a;
-    --muted:#6b7280; --brand:#2455f4; --brand2:#3b7bff; --line:#e5e7eb;
+  .product__modal-opener {
+    --corner-radius: {{ section.settings.image_card_corner_radius }}px;
+    border-radius: var(--corner-radius);
+    overflow: hidden;
   }
-  *{box-sizing:border-box}
-  body{
-    margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px;
-    background:radial-gradient(1200px 600px at 50% 20%, #0f1b36 0%, var(--bg) 50%, var(--bg2) 100%);
-    font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; color:#fff;
+  .main--product__media--small.media {
+    height: 30.4rem;
   }
-  .card{
-    width:min(440px,94vw);
-    background:var(--card); color:var(--ink);
-    border-radius:22px; border:1px solid rgba(255,255,255,.08);
-    box-shadow:0 40px 90px rgba(0,0,0,.45), 0 2px 0 rgba(0,0,0,.06) inset;
-    overflow:hidden;
+  .main--product__media--medium.media {
+    height: 38.4rem;
   }
-  .head{padding:28px 28px 6px}
-  .brand{display:flex;gap:12px;align-items:center}
-  .logo{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;
-        background:linear-gradient(135deg,var(--brand),var(--brand2)); color:#fff; font-weight:800}
-  .title{font-size:20px;font-weight:800}
-  .sub{font-size:12px;color:var(--muted)}
-  .body{padding:10px 28px 24px}
-  label{font-size:12px;color:var(--muted);display:block;margin:14px 0 6px}
-  input[type="text"], input[type="password"]{
-    width:100%; height:44px; border:1px solid var(--line); border-radius:12px; padding:0 12px; font-size:14px; outline:none;
+  .main--product__media--large.media {
+    height: 43.5rem;
   }
-  .btn{
-    width:100%; height:46px; margin-top:16px; border:0; border-radius:12px;
-    background:linear-gradient(180deg,var(--brand),var(--brand2)); color:#fff; font-weight:800; cursor:pointer;
+  .product__media_container .product__media-list {
+    border: 1px solid #ddd;
+    border-radius: 10px;
   }
-  .btn:active{transform:translateY(1px)}
-  .err{margin-top:10px;color:#991b1b;background:#fee2e2;border:1px solid #fecaca;padding:10px;border-radius:10px;font-size:13px}
-  .foot{padding:14px 28px 26px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between}
+
+  @media screen and (min-width: 750px) {
+    .main--product__media--small.media {
+      height: 50rem;
+    }
+    .main--product__media--medium.media {
+      height: 60rem;
+    }
+    .main--product__media--large.media {
+      height: 70rem;
+    }
+  }
+  .section-{{ section.id }}-padding {
+    padding-top: {{ section.settings.mobile_padding_top }}px;
+    padding-bottom: {{ section.settings.mobile_padding_bottom }}px;
+  }
+
+  @media screen and (min-width: 750px) {
+    .section-{{ section.id }}-padding {
+      padding-top: {{ section.settings.padding_top }}px;
+      padding-bottom: {{ section.settings.padding_bottom }}px;
+    }
+  }
 </style>
-</head>
-<body>
-  <form class="card" method="post" action="/admin/login">
-    <div class="head">
-      <div class="brand">
-        <div class="logo">Z</div>
-        <div>
-          <div class="title">Staff sign in</div>
-          <div class="sub">ZUVIC Support Admin</div>
+
+{%- liquid
+  assign current_variant = product.selected_or_first_available_variant
+
+  assign on_sale = false
+  if current_variant.compare_at_price != nill
+    assign on_sale = true
+  endif
+
+  assign productShortDescription = product.metafields.meta.product_excerpt.value
+  assign productSizeGuideHandler = product.metafields.meta.product_size_guide.value
+  assign productShippingPolicy = product.metafields.meta.product_shipping_policy.value
+
+  assign productCountdown = product.metafields.meta.product_countdown.value
+  assign todayDate = 'now' | date: '%s'
+  assign countDownDate = productCountdown | date: '%s'
+
+  if section.settings.media_size == 'large'
+    assign media_column = 'col-lg-7'
+    assign content_column = 'col-lg-5'
+    assign media_width = 0.67
+  elsif section.settings.media_size == 'medium'
+    assign media_column = 'col-lg-6'
+    assign content_column = 'col-lg-6'
+    assign media_width = 0.50
+  else
+    assign media_column = 'col-lg-5'
+    assign content_column = 'col-lg-7'
+    assign media_width = 0.42
+  endif
+-%}
+
+{%- assign first_3d_model = product.media | where: 'media_type', 'model' | first -%}
+{%- if first_3d_model -%}
+  {{ 'component-product-model.css' | asset_url | stylesheet_tag }}
+  <link
+    id="ModelViewerStyle"
+    rel="stylesheet"
+    href="https://cdn.shopify.com/shopifycloud/model-viewer-ui/assets/v1.0/model-viewer-ui.css"
+    media="print"
+    onload="this.media='all'"
+  >
+  <link
+    id="ModelViewerOverride"
+    rel="stylesheet"
+    href="{{ 'component-model-viewer-ui.css' | asset_url }}"
+    media="print"
+    onload="this.media='all'"
+  >
+{%- endif -%}
+
+<div
+  data-section-id="{{ section.id }}"
+  data-section-type="main-product"
+  class=" section-{{ section.id }}-padding color-{{ section.settings.color_scheme }} gradient"
+>
+  <div class="container">
+    <div class="product row row-cols-md-2 row-cols-1 product--{{ section.settings.media_size }} product--{{ section.settings.gallery_layout }}">
+      <div class="{{ media_column }}">
+        <div
+          class="product__media_container {% if section.settings.enable_sticky_info %} product__info-container--sticky{% endif %}"
+          style="--corner-radius: {{ section.settings.image_card_corner_radius }}px;"
+        >
+          <a class="skip-to-content-link button visually-hidden" href="#ProductInfo-{{ section.id }}">
+            {{ 'accessibility.skip_to_product_info' | t }}
+          </a>
+          {%- render 'product-page-layout-1',
+            product: product,
+            media_width: media_width,
+            page_width: page_width,
+            media_height: section.settings.media_height,
+            gallery_layout: gallery_layout,
+            hide_variants: hide_variants,
+            first_3d_model: first_3d_model
+          -%}
+        </div>
+      </div>
+      <div class="{{ content_column }}">
+        <div
+          id="ProductInfo-{{ section.id }}"
+          class="product__info-container {% if section.settings.top_space_enable %} top--space {% endif %} {% if section.settings.enable_sticky_info %} product__info-container--sticky{% endif %}"
+        >
+          {%- if section.settings.breadcrumb_enable -%}
+            <nav role="navigation" aria-label="breadcrumbs" class="breadcrumbs__wrapper">
+              <ol class="breadcrumbs__list d-flex">
+                <li class="breadcrumbs__item">
+                  <a class="breadcrumbs__link" href="/">{{ 'general.back_to_home_label' | t }}</a>
+                </li>
+                {%- if collection.url -%}
+                  <li class="breadcrumbs__item">
+                    {{ collection.title | link_to: collection.url }}
+                  </li>
+                {%- endif -%}
+                <li class="breadcrumbs__item">{{ product.title }}</li>
+              </ol>
+            </nav>
+          {%- endif -%}
+
+          {%- assign product_form_id = 'product-form-' | append: section.id -%}
+
+          {%- for block in section.blocks -%}
+            {%- case block.type -%}
+              {%- when '@app' -%}
+                {% render block %}
+              {%- when 'additinal_field' -%}
+                <div class="cart__additional--field" {{ block.shopify_attributes }}>
+                  {%- if block.settings.text_field -%}
+                    <div class="input__field_form">
+                      <label>
+                        <span class="input__field--label"
+                          ><b>{{ block.settings.text_field_label }}</b></span
+                        >
+                        <input
+                          class="field__input"
+                          type="text"
+                          id="engraving"
+                          name="properties[Name]"
+                          form="{{ product_form_id }}"
+                        >
+                      </label>
+                    </div>
+                  {%- endif -%}
+
+                  {%- if block.settings.file_field -%}
+                    <div class="input__field_form">
+                      <label>
+                        <span class="input__field--label"
+                          ><b>{{ block.settings.file_field_label }}</b></span
+                        >
+                        <input type="file" id="file" name="properties[File]" form="{{ product_form_id }}">
+                      </label>
+                    </div>
+                  {%- endif -%}
+                </div>
+              {%- when 'text' -%}
+                <p
+                  class="product__text{% if block.settings.text_style == 'uppercase' %} caption-with-letter-spacing{% elsif block.settings.text_style == 'subtitle' %} subtitle{% endif %}"
+                  {{ block.shopify_attributes }}
+                >
+                  {{- block.settings.text -}}
+                </p>
+              {%- when 'title' -%}
+                <h1 class="product__title" {{ block.shopify_attributes }}>
+                  {{ product.title | escape }}
+                </h1>
+              {%- when 'price' -%}
+                <div class="price__box_wrapper d-flex" id="price-{{ section.id }}" {{ block.shopify_attributes }}>
+                  <div class="no-js-hidden">
+                    {%- render 'price',
+                      product: product,
+                      use_variant: true,
+                      show_badges: true,
+                      price_class: 'price--large'
+                    -%}
+                  </div>
+                  <div class="save__disoucnt">
+                    <span class="discount__sale__text {% if on_sale == false %} no-js-inline {% endif %}">
+                      -<span class="sale__save--percent">
+                        {{-
+                          product.selected_or_first_available_variant.compare_at_price
+                          | minus: product.selected_or_first_available_variant.price
+                          | times: 100.0
+                          | divided_by: product.selected_or_first_available_variant.compare_at_price
+                          | money_without_currency
+                          | replace: ',', '.'
+                          | times: 100
+                          | remove: '.0'
+                        -}}</span
+                      >%</span
+                    >
+                  </div>
+                </div>
+
+                {%- if shop.taxes_included or shop.shipping_policy.body != blank -%}
+                  <div class="product__tax caption rte">
+                    {%- if shop.taxes_included -%}
+                      {{ 'products.product.include_taxes' | t }}
+                    {%- endif -%}
+                    {%- if shop.shipping_policy.body != blank -%}
+                      {{ 'products.product.shipping_policy_html' | t: link: shop.shipping_policy.url }}
+                    {%- endif -%}
+                  </div>
+                {%- endif -%}
+
+                <div {{ block.shopify_attributes }}>
+                  {%- form 'product', product, id: 'product-form-installment', class: 'installment caption-large' -%}
+                    <input type="hidden" name="id" value="{{ product.selected_or_first_available_variant.id }}">
+                    {{ form | payment_terms }}
+                  {%- endform -%}
+                </div>
+              {%- when 'popup_size_guide' -%}
+                <div class="product_additional_information" {{ block.shopify_attributes }}>
+                  <modal-opener
+                    class="product-popup-modal__opener no-js-hidden"
+                    data-modal="#PopupModal-1"
+                    {{ block.shopify_attributes }}
+                  >
+                    <button
+                      id="ProductPopup-1"
+                      class="product-popup-modal__button link"
+                      type="button"
+                      aria-haspopup="dialog"
+                    >
+                      {{ block.settings.size_guide }}
+                    </button>
+                  </modal-opener>
+                </div>
+              {%- when 'popup_text' -%}
+                <div class="product_additional_information" {{ block.shopify_attributes }}>
+                  <modal-opener
+                    class="product-popup-modal__opener no-js-hidden"
+                    data-modal="#PopupModal-2"
+                    {{ block.shopify_attributes }}
+                  >
+                    <button
+                      id="ProductPopup-2"
+                      class="product-popup-modal__button link"
+                      type="button"
+                      aria-haspopup="dialog"
+                    >
+                      {{ block.settings.popup_label }}
+                    </button>
+                  </modal-opener>
+                </div>
+
+              {%- when 'popup_contact_form' -%}
+                <div class="product_additional_information" {{ block.shopify_attributes }}>
+                  <modal-opener
+                    class="product-popup-modal__opener no-js-hidden"
+                    data-modal="#PopupModal-3"
+                    {{ block.shopify_attributes }}
+                  >
+                    <button
+                      id="ProductPopup-3"
+                      class="product-popup-modal__button link"
+                      type="button"
+                      aria-haspopup="dialog"
+                    >
+                      {{ block.settings.contact_form_label }}
+                    </button>
+                  </modal-opener>
+                </div>
+
+              {%- when 'description' -%}
+                <div class="product__accordion accordion" {{ block.shopify_attributes }}>
+                  <details
+                    {% if block.settings.always_open %}
+                      open
+                    {% endif %}
+                  >
+                    <summary>
+                      <div class="summary__title">
+                        {% render 'icon-accordion', icon: block.settings.icon %}
+                        <h2 class="h4 accordion__title">
+                          {{ block.settings.heading }}
+                        </h2>
+                      </div>
+                      {% render 'icon-caret' %}
+                    </summary>
+                    <div class="accordion__content rte">
+                      <!-- Example: Adding Judge.me widget to a product page -->
+                      <div class="product-reviews">
+                        <!-- Paste your Judge.me widget code here -->
+                        {{ '<script type="text/javascript" src="//cdn.judge.me/widget.js"></script>' | raw }}
+                      </div>
+
+                      {%- if block.settings.productdesc == 'shortdesc' and productShortDescription != blank -%}
+                        <div class="product__description rte">
+                          {{ productShortDescription | strip_html }}
+                        </div>
+                      {%- elsif block.settings.productdesc == 'fulldesc' and product.description != blank -%}
+                        {%- assign truncatewords_count = block.settings.truncatewords_count_handle -%}
+                        <div class="product__description rte">
+                          {{ product.description | truncatewords: truncatewords_count, '' }}
+                        </div>
+                      {%- endif -%}
+                    </div>
+                  </details>
+                </div>
+              {%- when 'inventory' -%}
+                {%- liquid
+                  if current_variant.inventory_quantity < 0
+                    assign progress_bar_width = 0
+                  else
+                    assign progress_bar_width = current_variant.inventory_quantity | times: 100 | divided_by: 30
+                  endif
+
+                  if progress_bar_width > 70
+                    assign progress_bar_width = 65
+                  endif
+                -%}
+
+                <div
+                  class="product-variant-inventory"
+                  id="inventory__stock--{{ section.id }}"
+                  {{ block.shopify_attributes }}
+                >
+                  <div class="{% if current_variant.inventory_quantity <= 0 and current_variant.inventory_policy == "continue" %}no-js-inline{% endif  %}">
+                    <span class="inventory-title {% if current_variant.inventory_quantity <= 1 %} no-js-inline {% endif %}">
+                      {{- 'products.product.inventory_status.availability' | t -}}
+                    </span>
+                    <span class="variant__inventory">
+                      <span class="in_stock__title  {% if current_variant.inventory_quantity <= 1 %} no-js-inline {% endif %}">
+                        <span class="variant__stock__amount">{{ current_variant.inventory_quantity }}</span>
+                        {{ 'products.product.inventory_status.in_stock' | t }}
+                      </span>
+                      <span class="out__of_stock {% if current_variant.inventory_quantity > 0 %} no-js-inline {% endif %}">
+                        {{- 'products.product.inventory_status.out_of_stock' | t -}}
+                      </span>
+                    </span>
+
+                    <div class="stock_countdown_progress">
+                      <span
+                        class="stock_progress_bar"
+                        style="width: {{ progress_bar_width }}%; --progress-bar-bg: {% if block.settings.gradient_accent_1 != blank %}{{ block.settings.gradient_accent_1 }} {% else %} {{ block.settings.colors_accent_1 }}{% endif %};"
+                      ></span>
+                    </div>
+                  </div>
+                </div>
+              {%- when 'countdown' -%}
+                {%- if todayDate < countDownDate -%}
+                  <div class="product__details_countdown">
+                    <countdown-timer
+                      style="--countdown-foreground: {{ block.settings.timer_foreground }} ; --countdown-background: {{ block.settings.timer_background }}"
+                      {{ block.shopify_attributes }}
+                    >
+                      <span class="countdown__label h6">
+                        {%- if block.settings.icon_enable -%}
+                          {%- render 'icon-clock', class: 'timer__icon' -%}
+                        {%- endif -%}
+                        {{ block.settings.countdown_label -}}
+                      </span>
+                      <div
+                        class="product__countdown color-{{ block.settings.color_scheme }}"
+                        data-countdown="{{ productCountdown }}"
+                      ></div>
+                    </countdown-timer>
+                  </div>
+                {%- endif -%}
+
+              {%- when 'custom_liquid' -%}
+                {{ block.settings.custom_liquid }}
+              {%- when 'collapsible_tab' -%}
+                <div class="product__accordion accordion" {{ block.shopify_attributes }}>
+                  <details>
+                    <summary>
+                      <div class="summary__title">
+                        {% render 'icon-accordion', icon: block.settings.icon %}
+                        <h2 class="h4 accordion__title">
+                          {{ block.settings.heading | default: block.settings.page.title }}
+                        </h2>
+                      </div>
+                      {% render 'icon-caret' %}
+                    </summary>
+                    <div class="accordion__content rte">
+                      {{ block.settings.content }}
+                      {{ block.settings.page.content }}
+                    </div>
+                  </details>
+                </div>
+              {%- when 'share' -%}
+                <div class="social__share_box d-flex align-items-center" {{ block.shopify_attributes }}>
+                  {%- render 'social-share', block: block -%}
+
+                  {%- if block.settings.share_link -%}
+                    <share-button class="share-button">
+                      <button class="share-button__button hidden">
+                        {% render 'icon-share' %}
+                        {{ block.settings.share_label | escape }}
+                      </button>
+                      <details>
+                        <summary class="share-button__button">
+                          {% render 'icon-share' %}
+                          {{ block.settings.share_label | escape }}
+                        </summary>
+                        <div id="Product-share-{{ section.id }}" class="share-button__fallback motion-reduce">
+                          <div class="field">
+                            <span id="ShareMessage-{{ section.id }}" class="share-button__message hidden" role="status">
+                            </span>
+                            <input
+                              type="text"
+                              class="field__input"
+                              id="url"
+                              value="{{ shop.url | append: product.url }}"
+                              placeholder="{{ 'general.share.share_url' | t }}"
+                              onclick="this.select();"
+                              readonly
+                            >
+                            <label class="field__label" for="url">{{ 'general.share.share_url' | t }}</label>
+                          </div>
+                          <button class="share-button__close hidden no-js-hidden">
+                            {% render 'icon-close' %}
+                            <span class="visually-hidden">{{ 'general.share.close' | t }}</span>
+                          </button>
+                          <button class="share-button__copy no-js-hidden">
+                            {% render 'icon-clipboard' %}
+                            <span class="visually-hidden">{{ 'general.share.copy_to_clipboard' | t }}</span>
+                          </button>
+                        </div>
+                      </details>
+                    </share-button>
+                  {%- endif -%}
+                </div>
+                <script src="{{ 'share.js' | asset_url }}" defer="defer"></script>
+              {%- when 'variant_picker' -%}
+                {%- unless product.has_only_default_variant -%}
+                  {%- if block.settings.picker_type == 'button' -%}
+                    {%- if block.settings.show_color_swatch -%}
+                      {%- render 'variant-color-swatch', block: block, product: product -%}
+                    {%- else -%}
+                      {%- render 'variant-radios', block: block, product: product -%}
+                    {%- endif -%}
+                  {%- else -%}
+                    <variant-selects
+                      class="no-js-hidden"
+                      data-section="{{ section.id }}"
+                      data-origin="{{ request.origin }}"
+                      data-url="{{ product.url }}"
+                      {{ block.shopify_attributes }}
+                    >
+                      {%- for option in product.options_with_values -%}
+                        <div class="product-form__input product-form__input--dropdown">
+                          <label class="form__label" for="Option-{{ section.id }}-{{ forloop.index0 }}">
+                            <strong>{{ option.name }}:</strong> <span>{{ option.selected_value }}</span>
+                          </label>
+                          <div class="select">
+                            <select
+                              id="Option-{{ section.id }}-{{ forloop.index0 }}"
+                              class="select__select"
+                              name="options[{{ option.name | escape }}]"
+                              form="product-form-{{ section.id }}"
+                            >
+                              {%- for value in option.values -%}
+                                <option
+                                  value="{{ value | escape }}"
+                                  {% if option.selected_value == value %}
+                                    selected="selected"
+                                  {% endif %}
+                                >
+                                  {{ value }}
+                                </option>
+                              {%- endfor -%}
+                            </select>
+                            {% render 'icon-caret' %}
+                          </div>
+                        </div>
+                      {%- endfor -%}
+
+                      <script type="application/json" data-variant>
+                        {{ product.variants | json }}
+                      </script>
+                      <script type="application/json" data-preorder>
+                        {%- assign firstBrackets = '{'  -%}
+                        {%- assign seconrdBrackets = '}'  -%}
+                        {{ firstBrackets }}
+                        {%- for variant in product.variants -%}
+                        "{{variant.id}}": {"qty": {{variant.inventory_quantity}}, "inventory_policy": "{{variant.inventory_policy}}"}{% unless forloop.last == true %},{% endunless %}
+                          {%- endfor -%}
+                          {{ seconrdBrackets }}
+                      </script>
+                    </variant-selects>
+                  {%- endif -%}
+                {%- endunless -%}
+
+                <noscript class="product-form__noscript-wrapper-{{ section.id }}">
+                  <div class="product-form__input{% if product.has_only_default_variant %} hidden{% endif %}">
+                    <label class="form__label" for="Variants-{{ section.id }}">
+                      {{- 'products.product.product_variants' | t -}}
+                    </label>
+                    <div class="select">
+                      <select
+                        name="id"
+                        id="Variants-{{ section.id }}"
+                        class="select__select"
+                        form="product-form-{{ section.id }}"
+                      >
+                        {%- for variant in product.variants -%}
+                          <option
+                            {% if variant == product.selected_or_first_available_variant %}
+                              selected="selected"
+                            {% endif %}
+                            {% if variant.available == false %}
+                              disabled
+                            {% endif %}
+                            value="{{ variant.id }}"
+                          >
+                            {{ variant.title }}
+                            {%- if variant.available == false %} - {{ 'products.product.sold_out' | t }}{% endif %}
+                            - {{ variant.price | money | strip_html }}
+                          </option>
+                        {%- endfor -%}
+                      </select>
+                      {% render 'icon-caret' %}
+                    </div>
+                  </div>
+                </noscript>
+              {%- when 'buy_buttons' -%}
+                <div {{ block.shopify_attributes }}>
+                  <product-form class="product-form mb-20 product_buy_button_form">
+                    <div class="product-form__error-message-wrapper no-js-inline" role="alert" hidden>
+                      <svg
+                        aria-hidden="true"
+                        focusable="false"
+                        role="presentation"
+                        class="icon icon-error"
+                        viewBox="0 0 13 13"
+                      >
+                        <circle cx="6.5" cy="6.50049" r="5.5" stroke="white" stroke-width="2"/>
+                        <circle cx="6.5" cy="6.5" r="5.5" fill="#EB001B" stroke="#EB001B" stroke-width="0.7"/>
+                        <path d="M5.87413 3.52832L5.97439 7.57216H7.02713L7.12739 3.52832H5.87413ZM6.50076 9.66091C6.88091 9.66091 7.18169 9.37267 7.18169 9.00504C7.18169 8.63742 6.88091 8.34917 6.50076 8.34917C6.12061 8.34917 5.81982 8.63742 5.81982 9.00504C5.81982 9.37267 6.12061 9.66091 6.50076 9.66091Z" fill="white"/>
+                        <path d="M5.87413 3.17832H5.51535L5.52424 3.537L5.6245 7.58083L5.63296 7.92216H5.97439H7.02713H7.36856L7.37702 7.58083L7.47728 3.537L7.48617 3.17832H7.12739H5.87413ZM6.50076 10.0109C7.06121 10.0109 7.5317 9.57872 7.5317 9.00504C7.5317 8.43137 7.06121 7.99918 6.50076 7.99918C5.94031 7.99918 5.46982 8.43137 5.46982 9.00504C5.46982 9.57872 5.94031 10.0109 6.50076 10.0109Z" fill="white" stroke="#EB001B" stroke-width="0.7">
+                      </svg>
+                      <span class="product-form__error-message"></span>
+                    </div>
+
+                    {%- form 'product',
+                      product,
+                      id: product_form_id,
+                      class: 'form',
+                      novalidate: 'novalidate',
+                      data-type: 'add-to-cart-form'
+                    -%}
+                      <input type="hidden" name="id" value="{{ product.selected_or_first_available_variant.id }}">
+                      <div class="product-form__buttons">
+                        <div class="product-form__cart--box d-flex align-items-end">
+                          {%- if block.settings.quantity__button -%}
+                            <div class="product-form__input product-form__quantity">
+                              <label class="form__label" for="Quantity-{{ section.id }}">
+                                <strong>{{ 'products.product.quantity.label' | t }}</strong>
+                              </label>
+
+                              <quantity-input class="quantity">
+                                <button class="quantity__button no-js-hidden" name="minus" type="button">
+                                  <span class="visually-hidden">
+                                    {{- 'products.product.quantity.decrease' | t: product: product.title | escape -}}
+                                  </span>
+                                  {% render 'icon-minus' %}
+                                </button>
+                                <input
+                                  class="quantity__input"
+                                  type="number"
+                                  name="quantity"
+                                  id="Quantity-{{ section.id }}"
+                                  min="1"
+                                  value="1"
+                                  form="product-form-{{ section.id }}"
+                                >
+                                <button class="quantity__button no-js-hidden" name="plus" type="button">
+                                  <span class="visually-hidden">
+                                    {{- 'products.product.quantity.increase' | t: product: product.title | escape -}}
+                                  </span>
+                                  {% render 'icon-plus' %}
+                                </button>
+                              </quantity-input>
+                            </div>
+                          {%- endif -%}
+
+                          <div class="product__add__cart__button">
+                            <button
+                              type="submit"
+                              name="add"
+                              class="product-form__submit button {% if block.settings.show_dynamic_checkout and product.selling_plan_groups == empty %} button--{{ block.settings.add_to_cart__button }}{% else %}button--primary{% endif %}"
+                              {% if product.selected_or_first_available_variant.available == false %}
+                                disabled
+                              {% endif %}
+                            >
+                              {%- if current_variant.available -%}
+                                {%- if current_variant.inventory_quantity <= 0
+                                  and current_variant.inventory_policy == 'continue'
+                                -%}
+                                  {{ 'products.product.preorder' | t }}
+                                {%- else -%}
+                                  {{ 'products.product.add_to_cart' | t }}
+                                {%- endif -%}
+                              {%- else -%}
+                                {{ 'products.product.sold_out' | t }}
+                              {%- endif -%}
+                            </button>
+                          </div>
+                        </div>
+
+                        {%- if block.settings.show_dynamic_checkout -%}
+                          {{ form | payment_button }}
+                        {%- endif -%}
+                      </div>
+                    {%- endform -%}
+                  </product-form>
+
+                  <modal-opener
+                    class="product-popup-modal__opener notify__me--available mb-30 {% if current_variant.available == true %}no-js-inline{% endif %}"
+                    data-modal="#PopupModal-4"
+                    {{ block.shopify_attributes }}
+                  >
+                    <button
+                      id="ProductPopup-notify"
+                      class="product-popup-modal__button link"
+                      type="button"
+                      aria-haspopup="dialog"
+                    >
+                      {{ 'products.product.back_in_stock_notify.button' | t }}
+                    </button>
+                  </modal-opener>
+
+                  {%- if block.settings.guarantee_safe_checkout -%}
+                    <div class="guarantee__safe__checkout">
+                      <p>{{ block.settings.safe_checkout_text }}</p>
+                      <ul class="list d-flex product__payment mb-20" role="list">
+                        {%- for type in shop.enabled_payment_types -%}
+                          <li class="product__payment__item">
+                            {{ type | payment_type_svg_tag: class: 'icon icon--full-color' }}
+                          </li>
+                        {%- endfor -%}
+                      </ul>
+                    </div>
+                  {%- endif -%}
+
+                  {{ 'component-pickup-availability.css' | asset_url | stylesheet_tag }}
+
+                  {%- assign pick_up_availabilities = product.selected_or_first_available_variant.store_availabilities
+                    | where: 'pick_up_enabled', true
+                  -%}
+
+                  <pickup-availability
+                    class="product__pickup-availabilities no-js-hidden"
+                    {% if product.selected_or_first_available_variant.available and pick_up_availabilities.size > 0 %}
+                      available
+                    {% endif %}
+                    data-root-url="{{ routes.root_url }}"
+                    data-variant-id="{{ product.selected_or_first_available_variant.id }}"
+                    data-has-only-default-variant="{{ product.has_only_default_variant }}"
+                  >
+                    <template>
+                      <pickup-availability-preview class="pickup-availability-preview">
+                        {% render 'icon-unavailable' %}
+                        <div class="pickup-availability-info">
+                          <p class="caption-large">{{ 'products.product.pickup_availability.unavailable' | t }}</p>
+                          <button class="pickup-availability-button link link--text underlined-link">
+                            {{ 'products.product.pickup_availability.refresh' | t }}
+                          </button>
+                        </div>
+                      </pickup-availability-preview>
+                    </template>
+                  </pickup-availability>
+                </div>
+
+                <script src="{{ 'pickup-availability.js' | asset_url }}" defer="defer"></script>
+
+              {%- when 'barcode' -%}
+                <div id="barcode__{{ section.id }}" {{ block.shopify_attributes }}>
+                  <div class="product__variant_barcode {% if current_variant.barcode == blank %} no-js-inline {% endif %}">
+                    <strong>{{ 'products.product.barcode' | t }}:</strong>
+                    <span class="barcode__unique_code">{{ current_variant.barcode }}</span>
+                  </div>
+                </div>
+              {%- when 'sku' -%}
+                <div id="sku__{{ section.id }}" {{ block.shopify_attributes }}>
+                  <div class="product__variant_sku {% if current_variant.sku == blank %} no-js-inline {% endif %}">
+                    <strong>{{ 'products.product.sku' | t }}:</strong>
+                    <span class="sku__unique_code">{{ current_variant.sku }}</span>
+                  </div>
+                </div>
+              {%- when 'vendor' -%}
+                {%- if product.vendor != blank -%}
+                  <div class="product__vendor" {{ block.shopify_attributes }}>
+                    <strong>{{ 'products.product.vendor' | t }}:</strong> {{ product.vendor }}
+                  </div>
+                {%- endif -%}
+              {%- when 'type' -%}
+                {%- if product.type != blank -%}
+                  <div class="product__type" {{ block.shopify_attributes }}>
+                    <strong>{{ 'products.product.type' | t }}:</strong> {{ product.type }}
+                  </div>
+                {%- endif -%}
+
+              {%- when 'rating' -%}
+                {%- if product.metafields.reviews.rating.value != blank -%}
+                  {% liquid
+                    assign rating_decimal = 0
+                    assign decimal = product.metafields.reviews.rating.value.rating | modulo: 1
+                    if decimal >= 0.3 and decimal <= 0.7
+                      assign rating_decimal = 0.5
+                    elsif decimal > 0.7
+                      assign rating_decimal = 1
+                    endif
+                  %}
+                  <div
+                    class="rating"
+                    role="img"
+                    aria-label="{{ 'accessibility.star_reviews_info' | t: rating_value: product.metafields.reviews.rating.value, rating_max: product.metafields.reviews.rating.value.scale_max }}"
+                  >
+                    <span
+                      aria-hidden="true"
+                      class="rating-star color-icon-{{ settings.accent_icons }}"
+                      style="--rating: {{ product.metafields.reviews.rating.value.rating | floor }}; --rating-max: {{ product.metafields.reviews.rating.value.scale_max }}; --rating-decimal: {{ rating_decimal }};"
+                    ></span>
+                  </div>
+                  <p class="rating-text caption">
+                    <span aria-hidden="true">
+                      {{- product.metafields.reviews.rating.value }} /
+                      {{ product.metafields.reviews.rating.value.scale_max -}}
+                    </span>
+                  </p>
+                  <p class="rating-count caption">
+                    <span aria-hidden="true">({{ product.metafields.reviews.rating_count }})</span>
+                    <span class="visually-hidden">
+                      {{- product.metafields.reviews.rating_count }}
+                      {{ 'accessibility.total_reviews' | t -}}
+                    </span>
+                  </p>
+                {%- endif -%}
+            {%- endcase -%}
+          {%- endfor -%}
         </div>
       </div>
     </div>
-    <div class="body">
-      ${err ? `<div class="err">Invalid username or password.</div>` : ``}
-      <input type="hidden" name="next" value="${nextPath}">
-      <label>Username</label>
-      <input name="username" type="text" autocomplete="username" spellcheck="false" required>
-      <label>Password</label>
-      <input name="password" type="password" autocomplete="current-password" required>
-      <button class="btn" type="submit">Sign in</button>
-    </div>
-    <div class="foot">
-      <span>© ${new Date().getFullYear()} ZUVIC</span>
-      <span>Secure area</span>
-    </div>
-  </form>
-</body>
-</html>`);
-});
 
-// Login POST: set signed cookie and redirect
-app.post("/admin/login", loginLimiter, express.urlencoded({ extended: false }), (req, res) => {
-  const nextPath = String(req.body.next || "/admin/panel");
-  const user = String(req.body.username || "");
-  const pass = String(req.body.password || "");
-  const remember = false; // always 12h session
+    <product-modal id="ProductModal-{{ section.id }}" class="product-media-modal media-modal">
+      <div
+        class="product-media-modal__dialog"
+        role="dialog"
+        aria-label="{{ 'products.modal.label' | t }}"
+        aria-modal="true"
+        tabindex="-1"
+      >
+        <button
+          id="ModalClose-{{ section.id }}"
+          type="button"
+          class="product-media-modal__toggle"
+          aria-label="{{ 'accessibility.close' | t }}"
+        >
+          {% render 'icon-close' %}
+        </button>
 
-  if (user === UI_USER && pass === UI_PASS) {
-    const token = makeToken(remember ? 72 : 12); // 72h if remembered, else 12h
-    res.cookie("ui_session", token, {
-      httpOnly: true,
-      sameSite: "Strict",
-      secure: isSecure(req),
-      path: "/admin",
-    });
-    return res.redirect(nextPath);
-  }
-  return res.redirect(`/admin/login?err=1&next=${encodeURIComponent(nextPath)}`);
-});
+        <div
+          class="product-media-modal__content"
+          role="document"
+          aria-label="{{ 'products.modal.label' | t }}"
+          tabindex="0"
+        >
+          {%- liquid
+            if product.selected_or_first_available_variant.featured_media != null
+              assign media = product.selected_or_first_available_variant.featured_media
+              render 'product-media', media: media, loop: section.settings.enable_video_looping, variant_image: section.settings.hide_variants
+            endif
+          -%}
 
-// Logout → back to login
-app.get("/admin/logout", (req, res) => {
-  res.clearCookie("ui_session", { path: "/admin" });
-  return res.redirect("/admin/login");
-});
+          {%- for media in product.media -%}
+            {%- liquid
+              if section.settings.hide_variants and variant_images contains media.src
+                assign variant_image = true
+              else
+                assign variant_image = false
+              endif
 
-// /admin/panel — full-width, live updates + modal (NO "resolved")
-app.get("/admin/panel", requireUIPage, (req, res) => {
-  const nonce = crypto.randomBytes(16).toString("base64");
-  res.setHeader(
-    "Content-Security-Policy",
-    `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'self'; frame-ancestors 'none'`
-  );
-
-  res.type("html").send(`<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>ZUVIC • Support tickets</title>
-<style>
-  :root{
-    --bg:#ffffff; --fg:#0f172a; --muted:#64748b; --card:#fff;
-    --border:#e5e7eb; --primary:#1d4ed8; --pill:#eef2ff; --pillfg:#3730a3;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
-  body.modal-open{overflow:hidden}
-  a{color:#1d4ed8;text-decoration:none}
-  .wrap{padding:20px 20px 32px}
-  .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-  .title{font-size:24px;font-weight:700}
-  .logout{color:var(--primary)}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px}
-
-  .tabs{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
-  .chip{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:999px;border:1px solid var(--border);background:#1D4ED8;cursor:pointer;font-size:13px}
-  .chip.active{background:var(--primary);border-color:var(--primary);color:#fff}
-  .chip .count{opacity:.9}
-
-  .filters{
-    display:grid;
-    grid-template-columns: minmax(130px,160px) minmax(140px,180px) minmax(90px,120px) 1fr auto auto;
-    gap:8px;
-    margin-bottom:10px;
-    align-items:end;
-  }
-  .filters > label{font-size:11px;color:var(--muted);display:grid;gap:5px;margin:0}
-  select,input,button{height:34px;border:1px solid var(--border);border-radius:8px;background:#fff;color:#fff;font-size:13px}
-  select,input{color:var(--fg);padding:0 10px}
-  .filters > button{align-self:end}
-  button.btn{border-color:var(--primary);background:var(--primary);color:#fff;cursor:pointer}
-  button.ghost{background:#fff;color:#111}
-
-  .table-wrap{border:1px solid var(--border);border-radius:12px;background:#fff;overflow-x:auto}
-  table{width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed}
-  col.order   {width:16%}
-  col.ticket  {width:12%}
-  col.status  {width:12%}
-  col.issue   {width:12%}
-  col.customer{width:12%}
-  col.when    {width:12%}
-  col.when2   {width:12%}
-  col.actions {width:12%}
-  thead th{position:sticky;top:0;background:#fafafa;z-index:2}
-  th,td{padding:10px 12px;vertical-align:middle;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  th+th, td+td{border-left:1px solid var(--border)}
-  tbody tr+tr td{border-top:1px solid var(--border)}
-
-  .order small{display:block;color:var(--muted);margin-top:2px}
-  .pill{display:inline-block;padding:3px 9px;border-radius:999px;background:var(--pill);color:var(--pillfg);font-size:12px}
-
-  td.actions{overflow:visible}
-  .actions-cell{
-    display:flex;
-    gap:8px;
-    align-items:center;
-    white-space:nowrap;
-    flex-wrap:wrap;
-  }
-  .actions-cell select{
-    min-width:140px;
-    flex:1 1 140px;
-  }
-  .save-btn{
-    height:34px;border-radius:8px;background:var(--primary);color:#fff;border:0;padding:0 14px;cursor:pointer;
-    flex:0 0 auto;
-  }
-
-  @media (max-width: 900px){
-    table{table-layout:auto}
-    colgroup col{width:auto !important}
-  }
-  @media (max-width: 600px){
-    .actions-cell{flex-direction:column; align-items:stretch}
-    .actions-cell select{width:100%}
-    .save-btn{width:100%}
-  }
-
-  .muted{color:var(--muted)}
-  .toast{position:fixed;right:14px;bottom:14px;background:#111827;color:#fff;padding:9px 11px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s}
-  .toast.show{opacity:1;transform:translateY(0)}
-
-  .overlay{position:fixed;inset:0;background:rgba(15,23,42,.45);display:none;align-items:center;justify-content:center;padding:12px;z-index:9999}
-  .overlay.show{display:flex}
-  .modal{width:min(920px,96vw);background:#fff;border-radius:16px;border:1px solid var(--border);box-shadow:0 28px 70px rgba(0,0,0,.25)}
-  .modal .head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border)}
-  .modal .head .h{font-weight:700}
-  .modal .body{padding:14px 16px;display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  .modal label{font-size:11px;color:var(--muted)}
-  .modal input, .modal select, .modal textarea{width:100%;height:38px;border:1px solid var(--border);border-radius:10px;padding:0 10px;font-size:13px}
-  .modal textarea{height:110px;padding:8px 10px;resize:vertical}
-  .modal .foot{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border)}
-  .modal .btn{height:40px;border-radius:10px;border:0;padding:0 14px;cursor:pointer}
-  .modal .primary{background:var(--primary);color:#fff}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="topbar">
-    <div class="title">Support tickets</div>
-    <a class="logout" href="/admin/logout">Logout</a>
-  </div>
-
-  <div class="card">
-    <div class="tabs" id="tabs">
-      <button class="chip active" data-status="all">All <span class="count" id="c_all">0</span></button>
-      <button class="chip" data-status="pending">Pending <span class="count" id="c_pending">0</span></button>
-      <button class="chip" data-status="in_progress">In progress <span class="count" id="c_in_progress">0</span></button>
-      <button class="chip" data-status="closed">Closed <span class="count" id="c_closed">0</span></button>
-    </div>
-
-    <div class="filters">
-      <label>Status
-        <select id="st">
-          <option value="all">all</option>
-          <option value="pending">pending</option>
-          <option value="in_progress">in_progress</option>
-          <option value="closed">closed</option>
-        </select>
-      </label>
-      <label>Updated since
-        <input id="since" type="date"/>
-      </label>
-      <label>Limit
-        <input id="lim" type="number" min="1" max="1000" value="200"/>
-      </label>
-      <label>Search (ticket/order/name/email)
-        <input id="q" placeholder="Type to filter…"/>
-      </label>
-      <button id="go" class="btn">Refresh</button>
-      <button id="clr" class="btn ghost" type="button">Clear</button>
-    </div>
-
-    <div class="table-wrap">
-      <table id="tbl">
-        <colgroup>
-          <col class="order"><col class="ticket"><col class="status"><col class="issue">
-          <col class="customer"><col class="when"><col class="when2"><col class="actions">
-        </colgroup>
-        <thead>
-          <tr>
-            <th>Order</th><th>Ticket</th><th>Status</th><th>Issue</th>
-            <th>Customer</th><th>Created</th><th>Updated</th><th>Actions</th>
-          </tr>
-        </thead>
-        <tbody><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-</div>
-
-<div id="overlay" class="overlay" role="dialog" aria-modal="true">
-  <div class="modal">
-    <div class="head">
-      <div class="h" id="mh"></div>
-      <button id="mx" class="btn ghost" style="height:34px;border:1px solid var(--border);border-radius:8px">✕</button>
-    </div>
-    <div class="body">
-      <label>Ticket ID <input id="m_tid" readonly></label>
-      <label>Order <input id="m_order" readonly></label>
-      <label>Status
-        <select id="m_status">
-          <option value="pending">pending</option>
-          <option value="in_progress">in_progress</option>
-          <option value="closed">closed</option>
-        </select>
-      </label>
-      <label>Issue   <input id="m_issue"  readonly></label>
-      <label>Name    <input id="m_name"   readonly></label>
-      <label>Email   <input id="m_email"  readonly></label>
-      <label>Phone   <input id="m_phone"  readonly></label>
-      <label>Message <textarea id="m_message" readonly></textarea></label>
-      <label>Reply customer <textarea id="m_reply" placeholder="Type your reply to customer… (optional)"></textarea></label>
-      <label>Created <input id="m_created" readonly></label>
-      <label>Updated <input id="m_updated" readonly></label>
-    </div>
-    <div class="foot">
-      <button id="msave" class="btn primary">Save</button>
-      <button id="mclose" class="btn">Close</button>
-    </div>
-  </div>
-</div>
-
-<div id="toast" class="toast"></div>
-
-<script nonce="${nonce}">
-(function(){
-  const $  = (s)=>document.querySelector(s);
-  const $$ = (s)=>document.querySelectorAll(s);
-  const esc = (v)=> String(v ?? "").replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  const fmt = (d)=> d ? new Date(d).toLocaleString() : "—";
-  const pill = (s)=> '<span class="pill">'+esc(String(s||"").replace(/_/g," "))+'</span>';
-  const show = (msg)=>{ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1100); };
-
-  let currentStatus = "all";
-  let cacheTickets  = [];
-
-  function counts(list){
-    const c = { all:list.length, pending:0, in_progress:0, closed:0 };
-    list.forEach(t => { const s=(t.status||"pending").toLowerCase(); if (c[s]!=null) c[s]++; });
-    $("#c_all").textContent=c.all; $("#c_pending").textContent=c.pending; $("#c_in_progress").textContent=c.in_progress; $("#c_closed").textContent=c.closed;
-  }
-
-  function orderCell(t){
-    const id = t.order_id ? String(t.order_id) : "—";
-    const name = t.order_name ? String(t.order_name) : "—";
-    return '<div class="order"><div>'+esc(name)+'</div><small>ID: '+esc(id)+'</small></div>';
-  }
-
-  function row(t){
-    const locked = String(t.status||"").toLowerCase()==="closed";
-    const order = orderCell(t);
-    const ticketLink = '<a href="#" class="ticket-link" data-tid="'+esc(t.ticket_id)+'">'+esc(t.ticket_id)+'</a>';
-    const lockAttr = locked ? 'disabled title="Locked — customer can reopen from their account/ticket page"' : '';
-    return \`<tr data-row="\${esc(t.ticket_id)}">
-      <td>\${order}</td>
-      <td>\${ticketLink}</td>
-      <td>\${pill(t.status)}</td>
-      <td>\${esc(t.issue || "—")}</td>
-      <td>\${esc(t.name || "—")}</td>
-      <td>\${fmt(t.created_at)}</td>
-      <td>\${fmt(t.updated_at)}</td>
-      <td class="actions">
-        <div class="actions-cell">
-          <select class="set" \${lockAttr}>
-            <option value="pending" \${t.status==="pending"?"selected":""}>pending</option>
-            <option value="in_progress" \${t.status==="in_progress"?"selected":""}>in_progress</option>
-            <option value="closed" \${t.status==="closed"?"selected":""}>closed</option>
-          </select>
-          <button class="save-btn save" data-oid="\${t.order_id}" data-tid="\${esc(t.ticket_id)}" \${lockAttr}>Save</button>
+              unless media.id == product.selected_or_first_available_variant.featured_media.id
+                render 'product-media', media: media, loop: section.settings.enable_video_looping, variant_image: variant_image
+              endunless
+            -%}
+          {%- endfor -%}
         </div>
-      </td>
-    </tr>\`;
-  }
+      </div>
+    </product-modal>
 
-  function applyFilter(list){
-    const q = ($("#q").value||"").toLowerCase();
-    return list.filter(t => {
-      const byStatus = currentStatus==="all" ? true : (String(t.status).toLowerCase()===currentStatus);
-      if (!byStatus) return false;
-      if (!q) return true;
-      return [t.ticket_id,t.order_name,t.name,t.email].filter(Boolean).some(x=>String(x).toLowerCase().includes(q));
+    {% assign popups = section.blocks | where: 'type', 'popup_size_guide' %}
+    {%- for block in popups -%}
+      {% liquid
+        assign sizepagehandle = pages[block.settings.sizeguidhandle].content
+      %}
+      {%- if productSizeGuideHandler != blank -%}
+        <modal-dialog id="PopupModal-1" class="product-popup-modal" {{ block.shopify_attributes }}>
+          <div
+            role="dialog"
+            aria-label="{{ block.settings.text }}"
+            aria-modal="true"
+            class="product-popup-modal__content"
+            tabindex="-1"
+          >
+            <div class="modal-header">
+              <h5 class="modal__title">{{ block.settings.size_guide }}</h5>
+              <button
+                id="ModalClose-1"
+                type="button"
+                class="product-popup-modal__toggle"
+                aria-label="{{ 'accessibility.close' | t }}"
+              >
+                {% render 'icon-close' %}
+              </button>
+            </div>
+            <div class="product-popup-modal__content-info pt-25">
+              {%- if product.metafields.meta.product_size_guide.type == 'file_reference' -%}
+                <img src="{{ productSizeGuideHandler | img_url: "master" }}" alt="{{ "Product Size Guide" }}">
+              {%- else -%}
+                {{ productSizeGuideHandler }}
+              {%- endif -%}
+            </div>
+          </div>
+        </modal-dialog>
+      {%- else -%}
+        <modal-dialog id="PopupModal-1" class="product-popup-modal" {{ block.shopify_attributes }}>
+          <div
+            role="dialog"
+            aria-label="{{ block.settings.text }}"
+            aria-modal="true"
+            class="product-popup-modal__content"
+            tabindex="-1"
+          >
+            <div class="modal-header">
+              <h5 class="modal__title">{{ block.settings.size_guide }}</h5>
+              <button
+                id="ModalClose-1"
+                type="button"
+                class="product-popup-modal__toggle"
+                aria-label="{{ 'accessibility.close' | t }}"
+              >
+                {% render 'icon-close' %}
+              </button>
+            </div>
+            <div class="product-popup-modal__content-info pt-25 rte">
+              {%- if sizepagehandle != empty or block.settings.content != blank -%}
+                {{ block.settings.content }}
+                {{ sizepagehandle }}
+              {%- else -%}
+                Please select a page or Add metafield
+              {%- endif -%}
+            </div>
+          </div>
+        </modal-dialog>
+      {%- endif -%}
+    {%- endfor -%}
+
+    {% assign popup_text = section.blocks | where: 'type', 'popup_text' %}
+    {%- for block in popup_text -%}
+      {% liquid
+        assign shippinghandle = pages[block.settings.shipping_page_handle].content
+      %}
+      {%- if productShippingPolicy != blank -%}
+        <modal-dialog id="PopupModal-2" class="product-popup-modal modal-md" {{ block.shopify_attributes }}>
+          <div
+            role="dialog"
+            aria-label="{{ block.settings.text }}"
+            aria-modal="true"
+            class="product-popup-modal__content modal-md"
+            tabindex="-1"
+          >
+            <div class="modal-header">
+              <h5 class="modal__title">{{ block.settings.popup_label }}</h5>
+              <button
+                id="ModalClose-2"
+                type="button"
+                class="product-popup-modal__toggle"
+                aria-label="{{ 'accessibility.close' | t }}"
+              >
+                {% render 'icon-close' %}
+              </button>
+            </div>
+            <div class="product-popup-modal__content-info pt-25">
+              {%- if product.metafields.meta.product_shipping_policy.type == 'file_reference' -%}
+                <img src="{{ productShippingPolicy | img_url: "master" }}" alt="{{ "Product Shipping Policy" }}">
+              {%- else -%}
+                {{ productShippingPolicy }}
+              {%- endif -%}
+            </div>
+          </div>
+        </modal-dialog>
+      {%- else -%}
+        <modal-dialog id="PopupModal-2" class="product-popup-modal" {{ block.shopify_attributes }}>
+          <div
+            role="dialog"
+            aria-label="{{ block.settings.text }}"
+            aria-modal="true"
+            class="product-popup-modal__content modal-md"
+            tabindex="-1"
+          >
+            <div class="modal-header">
+              <h5 class="modal__title">{{ block.settings.popup_label }}</h5>
+              <button
+                id="ModalClose-2"
+                type="button"
+                class="product-popup-modal__toggle"
+                aria-label="{{ 'accessibility.close' | t }}"
+              >
+                {% render 'icon-close' %}
+              </button>
+            </div>
+            <div class="product-popup-modal__content-info pt-25 rte">
+              {%- if shippinghandle != empty or block.settings.content != blank -%}
+                {{ block.settings.content }}
+                {{ shippinghandle }}
+              {%- else -%}
+                Please select a page
+              {%- endif -%}
+            </div>
+          </div>
+        </modal-dialog>
+      {%- endif -%}
+    {%- endfor -%}
+
+    {% assign popup_form = section.blocks | where: 'type', 'popup_contact_form' %}
+    {%- for block in popup_form -%}
+      {%- liquid
+
+      -%}
+      <modal-dialog id="PopupModal-3" class="product-popup-modal popup__contact--form" {{ block.shopify_attributes }}>
+        <div
+          role="dialog"
+          aria-label="{{ block.settings.text }}"
+          aria-modal="true"
+          class="product-popup-modal__content modal-sm"
+          tabindex="-1"
+        >
+          <div class="modal-header">
+            <h5 class="modal__title">{{ block.settings.ask_about_prod_title }}</h5>
+            <button
+              id="ModalClose-3"
+              type="button"
+              class="product-popup-modal__toggle"
+              aria-label="{{ 'accessibility.close' | t }}"
+            >
+              {% render 'icon-close' %}
+            </button>
+          </div>
+
+          <div class="product-popup-modal__content-info pt-25">
+            {% form 'contact', class: 'ask_about_product' %}
+              <div class="row">
+                <div class="col-12">
+                  {% if form.posted_successfully? %}
+                    <p class="note form-success">{{ 'contact.form.post_success' | t }}</p>
+                  {% endif %}
+                  {{ form.errors | default_errors }}
+                </div>
+                <div class="col-md-6 mb-30">
+                  <label class="visually-hidden" for="PopupContactFormName">
+                    {{- block.settings.name_placeholder -}}
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="{{ block.settings.name_placeholder }}"
+                    class="{% if form.errors contains 'name' %}error{% endif %}"
+                    name="contact[name]"
+                    id="PopupContactFormName"
+                    value="{% if form.name %}{{ form.name }}{% elsif customer.name %}{{ customer.name }}{% endif %}"
+                  >
+                </div>
+                <div class="col-md-6 mb-30">
+                  <label class="visually-hidden" for="PopupContactFormEmail">
+                    {{- block.settings.email_placeholder -}}
+                  </label>
+                  <input
+                    type="email"
+                    required
+                    placeholder="{{ block.settings.email_placeholder }}"
+                    class="{% if form.errors contains 'email' %}error{% endif %}"
+                    name="contact[email]"
+                    id="PopupContactFormEmail"
+                    value="{% if form.email %}{{ form.email }}{% elsif customer.email %}{{ customer.email }}{% endif %}"
+                  >
+                </div>
+                <div class="col-lg-12 mb-30">
+                  <label class="visually-hidden" for="PopupContactPhone">{{ block.settings.phone_placeholder }}</label>
+                  <input
+                    type="text"
+                    name="contact[phone]"
+                    placeholder="{{ block.settings.phone_placeholder }}"
+                    id="PopupContactPhone"
+                    value="{{ form.phone }}"
+                  >
+                </div>
+                <div class="col-lg-12 mb-30">
+                  <label class="visually-hidden" for="PopupCoPopupContactUrlntactUrl">
+                    {{- block.settings.prod_url_placeholder -}}
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    name="contact[productURL]"
+                    placeholder="{{ block.settings.prod_url_placeholder }}"
+                    id="PopupContactUrl"
+                    value="{{ shop.url | append: product.url }}"
+                  >
+                </div>
+                <div class="col-lg-12 mb-30">
+                  <label class="visually-hidden" for="PopupContactFormMessage">
+                    {{- block.settings.body_placeholder -}}
+                  </label>
+                  <textarea
+                    placeholder="{{ block.settings.body_placeholder }}"
+                    class="custom-textarea"
+                    name="contact[body]"
+                    id="PopupContactFormMessage"
+                  >{% if form.body %}{{ form.body }}{% endif %}</textarea>
+                </div>
+                <div class="col-lg-12 text-center">
+                  <button type="submit" value="submit" class="button">{{ block.settings.send_btn_text }}</button>
+                </div>
+              </div>
+            {% endform %}
+          </div>
+        </div>
+      </modal-dialog>
+    {%- endfor -%}
+
+    <modal-dialog id="PopupModal-4" class="product-popup-modal back__in--stock-popup" {{ block.shopify_attributes }}>
+      <div
+        role="dialog"
+        aria-label="{{ block.settings.text }}"
+        aria-modal="true"
+        class="product-popup-modal__content modal-sm"
+        tabindex="-1"
+      >
+        <div class="modal-header">
+          <h5 class="modal__title">{{ 'products.product.back_in_stock_notify.Popup_heading' | t }}</h5>
+          <button
+            id="ModalClose-4"
+            type="button"
+            class="product-popup-modal__toggle"
+            aria-label="{{ 'accessibility.close' | t }}"
+          >
+            {% render 'icon-close' %}
+          </button>
+        </div>
+
+        <div class="product-popup-modal__content-info pt-25">
+          {% form 'contact', class: 'ask_about_product' %}
+            <div class="row">
+              <div class="col-12">
+                {% if form.posted_successfully? %}
+                  <p class="note form-success">{{ 'Email has been sucessfully sent' }}</p>
+                {% endif %}
+                {{ form.errors | default_errors }}
+              </div>
+
+              <div class="col-md-12 mb-30">
+                <input
+                  type="email"
+                  class="w-100"
+                  required
+                  placeholder="{{ "products.product.back_in_stock_notify.email_placeholder" | t }}"
+                  class="{% if form.errors contains 'email' %}error{% endif %}"
+                  name="contact[email]"
+                  id="ContactFormEmail"
+                  value="{% if form.email %}{{ form.email }}{% elsif customer.email %}{{ customer.email }}{% endif %}"
+                >
+              </div>
+
+              <div class="d-none">
+                <textarea
+                  class="custom-textarea"
+                  name="contact[message]"
+                > {{ "products.product.back_in_stock_notify.Email_Body_First_Title" | t }} {{ product.title }} {{ "products.product.back_in_stock_notify.Email_Body_Last_Title" | t }} </textarea>
+              </div>
+
+              <div class="d-none">
+                <textarea
+                  class="soldout__product_url"
+                  name="contact[ProductURL]"
+                > {{ shop.url | append: product.url | append: "?variant=" | append: current_variant.id }}</textarea>
+              </div>
+
+              <div class="col-lg-12 text-center">
+                <button type="submit" value="submit" class="button">
+                  {{ 'products.product.back_in_stock_notify.submit' | t }}
+                </button>
+              </div>
+            </div>
+          {% endform %}
+        </div>
+      </div>
+    </modal-dialog>
+
+    {%- if section.settings.sticky_enable -%}
+      {%- render 'product-sticky-add-cart', current_variant: current_variant -%}
+    {%- endif -%}
+  </div>
+</div>
+
+<script src="{{ 'product-modal.js' | asset_url }}" defer="defer"></script>
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    function isIE() {
+      const ua = window.navigator.userAgent;
+      const msie = ua.indexOf('MSIE ');
+      const trident = ua.indexOf('Trident/');
+
+      return (msie > 0 || trident > 0);
+    }
+
+    if (!isIE()) return;
+    const hiddenInput = document.querySelector('#{{ product_form_id }} input[name="id"]');
+    const noScriptInputWrapper = document.createElement('div');
+    const variantSwitcher = document.querySelector('variant-radios[data-section="{{ section.id }}"]') || document.querySelector('variant-selects[data-section="{{ section.id }}"]');
+    noScriptInputWrapper.innerHTML = document.querySelector('.product-form__noscript-wrapper-{{ section.id }}').textContent;
+    variantSwitcher.outerHTML = noScriptInputWrapper.outerHTML;
+
+    document.querySelector('#Variants-{{ section.id }}').addEventListener('change', function(event) {
+      hiddenInput.value = event.currentTarget.value;
     });
-  }
-
-  function render(list){
-    counts(list);
-    const rows = applyFilter(list).map(row).join("") || '<tr><td colspan="8" class="muted">No tickets</td></tr>';
-    $("#tbl tbody").innerHTML = rows;
-
-    $("#tbl").querySelectorAll(".save").forEach(btn=>{
-      btn.onclick = async ()=>{
-        if (btn.hasAttribute("disabled")) {
-          return alert("This ticket is closed and locked. Only the customer can reopen.");
-        }
-        const tr = btn.closest("tr");
-        const status = tr.querySelector(".set").value;
-        const body = { order_id: btn.dataset.oid, ticket_id: btn.dataset.tid, status };
-        const r = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
-        if (r.status === 423) { alert("This ticket is closed and locked. Only the customer can reopen."); return; }
-        const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
-        if(!j.ok){ alert("Update failed: " + (j.error||"unexpected")); return; }
-        const idx = cacheTickets.findIndex(x => String(x.ticket_id)===String(j.ticket.ticket_id));
-        if(idx>=0) cacheTickets[idx] = { ...cacheTickets[idx], ...j.ticket };
-        else cacheTickets.push(j.ticket);
-        show("Updated");
-        render(cacheTickets);
-      };
-    });
-
-    $("#tbl").querySelectorAll(".ticket-link").forEach(a=>{
-      a.onclick = (e)=>{
-        e.preventDefault();
-        const t = cacheTickets.find(x => String(x.ticket_id)===String(a.dataset.tid));
-        if(!t) return;
-        $("#mh").textContent = "Ticket • " + t.ticket_id + (String(t.status).toLowerCase()==="closed" ? " (locked)" : "");
-        $("#m_tid").value = t.ticket_id || "";
-        $("#m_order").value = (t.order_name || "") + (t.order_id ? "  (ID: "+t.order_id+")" : "");
-        $("#m_status").value = t.status || "pending";
-        $("#m_issue").value  = t.issue || "";
-        $("#m_name").value   = t.name || "";
-        $("#m_email").value  = t.email || "";
-        $("#m_phone").value  = t.phone || "";
-        $("#m_message").value= t.message || "";
-        $("#m_reply").value  = t.admin_reply || "";
-        $("#m_created").value= fmt(t.created_at);
-        $("#m_updated").value= fmt(t.updated_at);
-
-        const locked = String(t.status||"").toLowerCase()==="closed";
-        $("#m_status").disabled  = locked;
-        $("#m_reply").disabled   = locked;
-        $("#msave").disabled     = locked;
-
-        $("#overlay").classList.add("show");
-        document.body.classList.add("modal-open");
-      };
-    });
-  }
-
-  async function load(){
-    const qs = new URLSearchParams({
-      status: $("#st").value || "all",
-      since:  $("#since").value || "",
-      limit:  $("#lim").value  || 200
-    });
-    const r = await fetch("/admin/ui/tickets?"+qs.toString(), { credentials:"include" });
-    const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
-    cacheTickets = Array.isArray(j?.tickets) ? j.tickets : [];
-    render(cacheTickets);
-  }
-
-  $("#tabs").addEventListener("click",(e)=>{
-    const b = e.target.closest(".chip"); if(!b) return;
-    currentStatus = b.dataset.status;
-    $$("#tabs .chip").forEach(x=>x.classList.toggle("active", x===b));
-    $("#st").value = currentStatus;
-    render(cacheTickets);
   });
-  $("#st").onchange = ()=>{ currentStatus=$("#st").value; $$("#tabs .chip").forEach(x=>x.classList.toggle("active", x.dataset.status===currentStatus)); render(cacheTickets); };
-  $("#q").oninput = ()=> render(cacheTickets);
-  $("#go").onclick  = load;
-  $("#clr").onclick = ()=>{ $("#st").value="all"; $("#since").value=""; $("#lim").value=200; $("#q").value=""; currentStatus="all"; $$("#tabs .chip").forEach(x=>x.classList.toggle("active", x.dataset.status==="all")); load(); };
-
-  const closeModal = ()=> { $("#overlay").classList.remove("show"); document.body.classList.remove("modal-open"); };
-  $("#mclose").onclick = closeModal;
-  $("#mx").onclick = closeModal;
-  $("#overlay").addEventListener("click",(e)=>{ if(e.target.id==="overlay") closeModal(); });
-
-  $("#msave").onclick = async ()=>{
-    if ($("#msave").disabled) {
-      return alert("This ticket is closed and locked. Only the customer can reopen.");
-    }
-    const tid = $("#m_tid").value;
-    const t   = cacheTickets.find(x => String(x.ticket_id)===String(tid));
-    if(!t) return;
-    const body = {
-      order_id: t.order_id,
-      ticket_id: t.ticket_id,
-      status: $("#m_status").value,
-      reply:  $("#m_reply").value
-    };
-    if (String(body.status).toLowerCase()==="closed") {
-      // saving a closed ticket is a no-op — block via server too
-      // (client guard helps UX)
-    }
-    const r = await fetch("/admin/ui/update", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body), credentials:"include" });
-    if (r.status === 423) { alert("This ticket is closed and locked. Only the customer can reopen."); return; }
-    const j = await r.json().catch(()=>({ok:false,error:"bad_json"}));
-    if(!j.ok){ alert("Update failed: " + (j.error||"unexpected")); return; }
-    const idx = cacheTickets.findIndex(x => String(x.ticket_id)===String(j.ticket.ticket_id));
-    if(idx>=0) cacheTickets[idx] = { ...cacheTickets[idx], ...j.ticket };
-    closeModal();
-    show("Updated");
-    render(cacheTickets);
-  };
-
-  load();
-})();
 </script>
-</body>
-</html>`);
-});
 
-// Admin UI JSON for panel (cookie-guarded)
-app.get("/admin/ui/tickets", requireUIAuth, async (req, res) => {
-  try {
-    const { since, status = "all", limit = 200 } = req.query || {};
-    const tickets = await collectTickets({ since, status: normalizeStatus(status), limit });
-    res.json({ ok: true, count: tickets.length, tickets });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+<script src="{{ 'custom-slider.js' | asset_url }}" defer></script>
+{%- if product.media.size > 0 -%}
+  <script src="{{ 'media-gallery.js' | asset_url }}" defer="defer"></script>
+{%- endif -%}
+
+{%- if first_3d_model -%}
+  <script type="application/json" id="ProductJSON-{{ product.id }}">
+    {{ product.media | where: 'media_type', 'model' | json }}
+  </script>
+
+  <script src="{{ 'product-model.js' | asset_url }}" defer></script>
+{%- endif -%}
+
+<script type="application/ld+json">
+  {
+    "@context": "http://schema.org/",
+    "@type": "Product",
+    "name": {{ product.title | json }},
+    "url": {{ shop.url | append: product.url | json }},
+    {%- if product.selected_or_first_available_variant.featured_media -%}
+      {%- assign media_size = product.selected_or_first_available_variant.featured_media.preview_image.width | append: 'x' -%}
+      "image": [
+        {{ product.selected_or_first_available_variant.featured_media | img_url: media_size | prepend: "https:" | json }}
+      ],
+    {%- endif -%}
+    "description": {{ product.description | strip_html | json }},
+    {%- if product.selected_or_first_available_variant.sku != blank -%}
+      "sku": {{ product.selected_or_first_available_variant.sku | json }},
+    {%- endif -%}
+    "brand": {
+      "@type": "Thing",
+      "name": {{ product.vendor | json }}
+    },
+    "offers": [
+      {%- for variant in product.variants -%}
+        {
+          "@type" : "Offer",
+          {%- if variant.sku != blank -%}
+            "sku": {{ variant.sku | json }},
+          {%- endif -%}
+          "availability" : "http://schema.org/{% if variant.available %}InStock{% else %}OutOfStock{% endif %}",
+          "price" : {{ variant.price | divided_by: 100.00 | json }},
+          "priceCurrency" : {{ cart.currency.iso_code | json }},
+          "url" : {{ shop.url | append: variant.url | json }}
+        }{% unless forloop.last %},{% endunless %}
+      {%- endfor -%}
+    ]
   }
-});
-app.post("/admin/ui/update", requireUIAuth, async (req, res) => {
-  try {
-    const { order_id, ticket_id } = req.body || {};
-    const status = normalizeStatus(req.body?.status || "pending");
-    const reply  = typeof req.body?.reply === "string" ? req.body.reply.slice(0, 4000) : undefined;
-    if (!order_id || !ticket_id)
-      return res.status(400).json({ ok: false, error: "missing order_id/ticket_id" });
+</script>
 
-    const orderGid = `gid://shopify/Order/${order_id}`;
-    const d1 = await adminGraphQL(
-      `query GetOrder($id:ID!){ order(id:$id){ name metafield(namespace:"support", key:"tickets"){ value } } }`,
-      { id: orderGid }
-    );
+{% schema %}
+{
+  "name": "t:sections.main-product.name",
+  "tag": "section",
+  "class": "product-section spaced-section",
+  "settings": [
+    {
+      "type": "color_scheme",
+      "id": "color_scheme",
+      "label": "t:sections.all.colors.label",
+      "default": "background-1"
+    },
+  	 {
+      "type": "header",
+      "content": "Breadcrumbs"
+    },
+  	{
+      "type": "checkbox",
+      "id": "breadcrumb_enable",
+      "default": true,
+      "label": "Show breadcrumbs"
+    },
+  	 {
+      "type": "header",
+      "content": "t:sections.main-product.settings.header.content",
+      "info": "t:sections.main-product.settings.header.info"
+    },
+    {
+      "type": "select",
+      "id": "gallery_layout",
+      "label": "Desktop layout",
+      "default": "thumbnail_slider",
+      "options": [
+          {
+            "value": "stacked",
+            "label": "Stacked"
+          },
+          {
+              "value": "thumbnail",
+              "label": "Thumbnails"
+          },
+  		  {
+              "value": "thumbnail_slider",
+              "label": "Thumbnails carousel"
+          }
+      ]
+    },
+  	{
+      "type": "select",
+      "id": "media_size",
+      "label": "Media size",
+      "default": "large",
+  	  "info": "Media is automatically optimized for mobile",
+      "options": [
+          {
+            "value": "large",
+            "label": "Large"
+          },
+          {
+              "value": "medium",
+              "label": "Medium"
+          },
+  		  {
+              "value": "small",
+              "label": "Small"
+          }
+      ]
+    },
+  	{
+      "type": "select",
+      "id": "media_height",
+      "label": "Image height",
+      "default": "adapt",
+      "options": [
+  		  {
+            "value": "adapt",
+            "label": "Adapt to image"
+          },
+          {
+            "value": "large",
+            "label": "Large"
+          },
+          {
+              "value": "medium",
+              "label": "Medium"
+          },
+  		  {
+              "value": "small",
+              "label": "Small"
+          }
+      ]
+    },
+  	{
+      "type": "select",
+      "id": "mobile_thumbnails",
+      "options": [
+        {
+          "value": "show",
+          "label": "Show thumbnails"
+        },
+        {
+          "value": "hide",
+          "label": "Hide thumbnails"
+        }
+      ],
+      "default": "show",
+      "label": "Mobile layout"
+    },
+    {
+      "type": "range",
+      "id": "image_card_corner_radius",
+      "min": 0,
+      "max": 32,
+      "step": 1,
+      "unit": "px",
+      "label": "Card corner radius",
+      "default": 10
+    },
+  	{
+      "type": "checkbox",
+      "id": "hide_variants",
+      "default": false,
+      "label": "Hide other variants’ media after selecting a variant"
+    },
+  	{
+      "type": "checkbox",
+      "id": "enable_sticky_info",
+      "default": true,
+      "label": "t:sections.main-product.settings.enable_sticky_info.label"
+    },
+    {
+  	 "type": "header",
+      "content": "Product information"
+    },
+  	{
+      "type": "checkbox",
+      "id": "top_space_enable",
+      "default": true,
+      "label": "Desktop top space"
+    },
+    {
+      "type": "header",
+      "content": "Sticky cart"
+    },
+    {
+      "type": "checkbox",
+      "id": "sticky_enable",
+      "default": true,
+      "label": "Enable"
+    },
+  	{
+          "type": "header",
+          "content": "Section padding"
+        },
+		{
+          "type": "paragraph",
+          "content": "Desktop"
+        },
+        {
+          "type": "range",
+          "id": "padding_top",
+          "min": 0,
+          "max": 150,
+          "step": 5,
+          "unit": "px",
+          "label": "Padding top",
+          "default": 0
+        },
+        {
+          "type": "range",
+          "id": "padding_bottom",
+          "min": 0,
+          "max": 150,
+          "step": 5,
+          "unit": "px",
+          "label": "Padding bottom",
+          "default": 0
+        },
+		{
+          "type": "paragraph",
+          "content": "Mobile"
+        },
+		{
+          "type": "range",
+          "id": "mobile_padding_top",
+          "min": 0,
+          "max": 150,
+          "step": 5,
+          "unit": "px",
+          "label": "Padding top",
+          "default": 0
+        },
+        {
+          "type": "range",
+          "id": "mobile_padding_bottom",
+          "min": 0,
+          "max": 150,
+          "step": 5,
+          "unit": "px",
+          "label": "Padding bottom",
+          "default": 0
+        }
+  ],
+  "blocks": [
+    {
+      "type": "@app"
+    },
+    {
+      "type": "text",
+      "name": "t:sections.main-product.blocks.text.name",
+      "settings": [
+        {
+          "type": "text",
+          "id": "text",
+          "default": "Text block",
+          "label": "t:sections.main-product.blocks.text.settings.text.label"
+        },
+        {
+          "type": "select",
+          "id": "text_style",
+          "options": [
+            {
+              "value": "body",
+              "label": "t:sections.main-product.blocks.text.settings.text_style.options__1.label"
+            },
+            {
+              "value": "subtitle",
+              "label": "t:sections.main-product.blocks.text.settings.text_style.options__2.label"
+            },
+            {
+              "value": "uppercase",
+              "label": "t:sections.main-product.blocks.text.settings.text_style.options__3.label"
+            }
+          ],
+          "default": "body",
+          "label": "t:sections.main-product.blocks.text.settings.text_style.label"
+        }
+      ]
+    },
+    {
+      "type": "title",
+      "name": "t:sections.main-product.blocks.title.name",
+      "limit": 1
+    },
+    {
+      "type": "price",
+      "name": "t:sections.main-product.blocks.price.name",
+      "limit": 1
+    },
+  	{
+      "type": "countdown",
+      "name": "Countdown timer",
+      "limit": 1,
+  	  "settings": [
+  		  {
+              "type": "text",
+              "id": "countdown_label",
+              "default": "Hurry up! Sale ends in",
+              "label": "Heading"
+          },
+  		  {
+            "type": "checkbox",
+            "id": "icon_enable",
+            "default": true,
+            "label": "Show icon"
+          },
+  		  {
+            "type": "color",
+            "id": "timer_background",
+            "default": "#121212",
+            "label": "Background color"
+          },
+  		  {
+            "type": "color",
+            "id": "timer_foreground",
+            "default": "#fff",
+            "label": "Text color"
+          },
+          {
+            "type": "header",
+            "content": "Countdown",
+            "info": "Follow the instructions on how to add a countdown timer to a product. [click here](https://themeadora.com/doc/product-countdown/)"
+          }
+  		]
+    },
+  	{
+      "type": "inventory",
+      "name": "Inventory status",
+      "limit": 1,
+  	  "settings": [
+  		  {
+            "type": "color",
+            "id": "colors_accent_1",
+            "default": "#121212",
+            "label": "Background color"
+          },
+          {
+            "id": "gradient_accent_1",
+            "type": "color_background",
+            "label": "Background gradient color"
+          }
+  		]
+    },
+  	{
+      "type": "vendor",
+      "name": "Vendor",
+      "limit": 1
+    },
+  	{
+      "type": "additinal_field",
+      "name": "Additional field",
+      "limit": 1,
+  	  "settings": [
+        {
+        "type": "checkbox",
+        "id": "text_field",
+        "default": true,
+        "label": "Show text field"
+        },
+  		{
+          "type": "text",
+          "id": "text_field_label",
+          "default": "Enter your name",
+          "label": "Text label"
+        },
+  		{
+        "type": "checkbox",
+        "id": "file_field",
+        "default": true,
+        "label": "Show file field"
+        },
+        {
+          "type": "text",
+          "id": "file_field_label",
+          "default": "Add your image",
+          "label": "File label"
+        }
+  	  ]
+    },
+  	{
+      "type": "type",
+      "name": "Type",
+      "limit": 1
+    },
+  	{
+      "type": "sku",
+      "name": "Sku",
+      "limit": 1
+    },
+  	{
+      "type": "barcode",
+      "name": "Barcode",
+      "limit": 1
+    },
+    {
+      "type": "variant_picker",
+      "name": "t:sections.main-product.blocks.variant_picker.name",
+      "limit": 1,
+      "settings": [
+        {
+          "type": "select",
+          "id": "picker_type",
+          "options": [
+            {
+              "value": "dropdown",
+              "label": "t:sections.main-product.blocks.variant_picker.settings.picker_type.options__1.label"
+            },
+            {
+              "value": "button",
+              "label": "t:sections.main-product.blocks.variant_picker.settings.picker_type.options__2.label"
+            }
+          ],
+          "default": "button",
+          "label": "t:sections.main-product.blocks.variant_picker.settings.picker_type.label"
+        },
+  		{
+          "type": "header",
+          "content": "COLOR SWATCHES",
+  		  "info": "Required! The variant picker type must be 'Button'"
+        },
+  		{
+          "type": "checkbox",
+          "id": "show_color_swatch",
+          "default": true,
+          "label": "Enable color swatches"
+        },
+  		{
+          "type": "select",
+          "id": "color_option_style",
+          "options": [
+            {
+              "value": "image",
+              "label": "Variant image"
+            },
+  			{
+              "value": "color",
+              "label": "Color swatch"
+            }
+          ],
+          "default": "color",
+          "label": "Swatch type"
+        },
+  		{
+          "type": "text",
+          "id": "choose_options_name",
+          "default": "Color",
+          "label": "Option name",
+  		  "info": "To show the image on variant"
+        },
+  		{
+          "type": "select",
+          "id": "color_option_design",
+          "options": [
+            {
+              "value": "round",
+              "label": "Round"
+            },
+  			{
+              "value": "square",
+              "label": "Square"
+            }
+          ],
+          "default": "round",
+          "label": "Color option style"
+        }
+      ]
+    },
+    {
+      "type": "buy_buttons",
+      "name": "t:sections.main-product.blocks.buy_buttons.name",
+      "limit": 1,
+      "settings": [
+  		{
+          "type": "checkbox",
+          "id": "quantity__button",
+          "default": true,
+          "label": "Show quantity button"
+        },
+        {
+          "type": "select",
+          "id": "add_to_cart__button",
+          "label": "Cart button type",
+          "default": "secondary",
+          "options": [
+            {
+              "value": "primary",
+              "label": "Primary"
+            },
+            {
+              "value": "secondary",
+              "label": "Secondary"
+            }
+          ]
+        },
+        {
+          "type": "checkbox",
+          "id": "show_dynamic_checkout",
+          "default": true,
+          "label": "t:sections.main-product.blocks.buy_buttons.settings.show_dynamic_checkout.label",
+          "info": "t:sections.main-product.blocks.buy_buttons.settings.show_dynamic_checkout.info"
+        },
+  		{
+        	"type": "header",
+        	"content": "guarantee safe checkout"
+        },
+  		{
+          "type": "checkbox",
+          "id": "guarantee_safe_checkout",
+          "default": false,
+          "label": "Show trust badge"
+        },
+        {
+          "type": "text",
+          "id": "safe_checkout_text",
+          "default": "Guaranteed safe checkout",
+          "label": "Trust badge text"
+        }
+      ]
+    },
+    {
+      "type": "description",
+      "name": "t:sections.main-product.blocks.description.name",
+      "limit": 1,
+	  "settings": [
+        {
+          "type": "text",
+          "id": "heading",
+          "default": "Description",
+          "label": "t:sections.main-product.blocks.collapsible_tab.settings.heading.label"
+        },
+        {
+          "type": "checkbox",
+          "id": "always_open",
+          "default": false,
+          "label": "Always show description"
+        },
+        {
+          "type": "select",
+          "id": "icon",
+          "options": [
+            {
+              "value": "none",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__1.label"
+            },
+            {
+              "value": "box",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__2.label"
+            },
+            {
+              "value": "chat_bubble",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__3.label"
+            },
+            {
+              "value": "check_mark",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__4.label"
+            },
+            {
+              "value": "dryer",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__5.label"
+            },
+            {
+              "value": "eye",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__6.label"
+            },
+            {
+              "value": "heart",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__7.label"
+            },
+            {
+              "value": "iron",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__8.label"
+            },
+            {
+              "value": "leaf",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__9.label"
+            },
+            {
+              "value": "leather",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__10.label"
+            },
+            {
+              "value": "lock",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__11.label"
+            },
+            {
+              "value": "map_pin",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__12.label"
+            },
+            {
+              "value": "pants",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__13.label"
+            },
+            {
+              "value": "plane",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__14.label"
+            },
+            {
+              "value": "price_tag",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__15.label"
+            },
+            {
+              "value": "question_mark",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__16.label"
+            },
+            {
+              "value": "return",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__17.label"
+            },
+            {
+              "value": "ruler",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__18.label"
+            },
+            {
+              "value": "shirt",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__19.label"
+            },
+            {
+              "value": "shoe",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__20.label"
+            },
+            {
+              "value": "silhouette",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__21.label"
+            },
+            {
+              "value": "star",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__22.label"
+            },
+            {
+              "value": "truck",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__23.label"
+            },
+            {
+              "value": "washing",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__24.label"
+            }
+          ],
+          "default": "check_mark",
+          "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.label"
+        },
+            {
+            "type": "radio",
+            "id": "productdesc",
+            "label": "Product Description",
+            "options": [
+                {
+                  "label": "Short Description",
+                  "value": "shortdesc"
+                },
+                {
+                  "label": "Full Description",
+                  "value": "fulldesc"
+                }
+              ],
+              "default": "shortdesc"
+            },
+            {
+              "type": "number",
+              "id": "truncatewords_count_handle",
+              "label": "Description Word Count",
+              "default": 35,
+              "info": "If 'Full Description' is selected, then it will be applicable"
+            },
+            {
+              "type": "header",
+              "content": "How to use Short Description",
+              "info": "Please check the documentation, [click here](https:\/\/themeadora.com\/doc\/product-short-description\/)"
+            }
+	   ]
+    },
+    {
+      "type": "share",
+      "name": "t:sections.main-product.blocks.share.name",
+      "limit": 1,
+      "settings": [
+        {
+          "type": "text",
+          "id": "share_label",
+          "label": "t:sections.main-product.blocks.share.settings.text.label",
+          "default": "Share"
+        },
+		 {
+          "type": "checkbox",
+          "id": "share_link",
+          "default": true,
+          "label": "Enable share link"
+        },
+		{
+          "type": "checkbox",
+          "id": "facebook_share",
+          "default": true,
+          "label": "Enable facebook share link"
+        },
+		{
+          "type": "checkbox",
+          "id": "twitter_share",
+          "default": true,
+          "label": "Enable twitter share link"
+        },
+		{
+          "type": "checkbox",
+          "id": "pinterest_share",
+          "default": true,
+          "label": "Enable pinterest share link"
+        },
+        {
+          "type": "paragraph",
+          "content": "t:sections.main-product.blocks.share.settings.featured_image_info.content"
+        },
+        {
+          "type": "paragraph",
+          "content": "t:sections.main-product.blocks.share.settings.title_info.content"
+        }
+      ]
+    },
+    {
+      "type": "custom_liquid",
+      "name": "t:sections.main-product.blocks.custom_liquid.name",
+      "settings": [
+        {
+          "type": "liquid",
+          "id": "custom_liquid",
+          "label": "t:sections.main-product.blocks.custom_liquid.settings.custom_liquid.label",
+          "info": "t:sections.main-product.blocks.custom_liquid.settings.custom_liquid.info"
+        }
+      ]
+    },
+    {
+      "type": "collapsible_tab",
+      "name": "t:sections.main-product.blocks.collapsible_tab.name",
+      "settings": [
+        {
+          "type": "text",
+          "id": "heading",
+          "default": "Collapsible tab",
+          "info": "t:sections.main-product.blocks.collapsible_tab.settings.heading.info",
+          "label": "t:sections.main-product.blocks.collapsible_tab.settings.heading.label"
+        },
+        {
+          "type": "richtext",
+          "id": "content",
+          "label": "t:sections.main-product.blocks.collapsible_tab.settings.content.label"
+        },
+        {
+          "type": "page",
+          "id": "page",
+          "label": "t:sections.main-product.blocks.collapsible_tab.settings.page.label"
+        },
+        {
+          "type": "select",
+          "id": "icon",
+          "options": [
+            {
+              "value": "none",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__1.label"
+            },
+            {
+              "value": "box",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__2.label"
+            },
+            {
+              "value": "chat_bubble",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__3.label"
+            },
+            {
+              "value": "check_mark",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__4.label"
+            },
+            {
+              "value": "dryer",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__5.label"
+            },
+            {
+              "value": "eye",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__6.label"
+            },
+            {
+              "value": "heart",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__7.label"
+            },
+            {
+              "value": "iron",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__8.label"
+            },
+            {
+              "value": "leaf",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__9.label"
+            },
+            {
+              "value": "leather",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__10.label"
+            },
+            {
+              "value": "lock",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__11.label"
+            },
+            {
+              "value": "map_pin",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__12.label"
+            },
+            {
+              "value": "pants",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__13.label"
+            },
+            {
+              "value": "plane",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__14.label"
+            },
+            {
+              "value": "price_tag",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__15.label"
+            },
+            {
+              "value": "question_mark",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__16.label"
+            },
+            {
+              "value": "return",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__17.label"
+            },
+            {
+              "value": "ruler",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__18.label"
+            },
+            {
+              "value": "shirt",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__19.label"
+            },
+            {
+              "value": "shoe",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__20.label"
+            },
+            {
+              "value": "silhouette",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__21.label"
+            },
+            {
+              "value": "star",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__22.label"
+            },
+            {
+              "value": "truck",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__23.label"
+            },
+            {
+              "value": "washing",
+              "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.options__24.label"
+            }
+          ],
+          "default": "check_mark",
+          "label": "t:sections.main-product.blocks.collapsible_tab.settings.icon.label"
+        }
+      ]
+    },
+    {
+      "type": "popup_size_guide",
+      "name": "Pop-up size guide",
+  	  "limit": 1,
+      "settings": [
+        {
+          "type": "text",
+          "id": "size_guide",
+          "label": "Size Guide Label",
+          "default": "Size Guide"
+        },
+  		{
+          "type": "richtext",
+          "id": "content",
+          "label": "Popup content"
+        },
+        {
+          "type": "page",
+          "id": "sizeguidhandle",
+          "label": "Select Page for Size Guide popup",
+          "info": "[Create a page](\/admin\/pages\/new)"
+        }
 
-    let map = {};
-    const raw = d1?.order?.metafield?.value;
-    if (raw) { try { map = JSON.parse(raw); } catch {} }
-
-    const now = new Date().toISOString();
-    const prev = map[ticket_id] || {};
-
-    // HARD LOCK for UI/Admin: cannot update once closed
-    if (isClosed(prev.status)) {
-      return res.status(423).json({ ok:false, error:"ticket_closed_admin_locked" });
+      ]
+    },
+  	{
+      "type": "popup_text",
+      "name": "Pop-up text",
+  	  "limit": 1,
+      "settings": [
+        {
+          "type": "text",
+          "id": "popup_label",
+          "label": "Pop-up text label",
+          "default": "Popup Text"
+        },
+  		 {
+          "type": "richtext",
+          "id": "content",
+          "label": "Popup content"
+        },
+        {
+          "type": "page",
+          "id": "shipping_page_handle",
+          "label": "Select Page for text popup",
+          "info": "[Create a page](\/admin\/pages\/new)"
+        }
+      ]
+    },
+  	{
+      "type": "popup_contact_form",
+      "name": "Pop-up contact form",
+  	  "limit": 1,
+      "settings": [
+        {
+          "type": "text",
+          "id": "contact_form_label",
+          "label": "Ask about product label",
+          "default": "Ask About This product "
+        },
+        {
+          "type": "text",
+          "id": "ask_about_prod_title",
+          "label": "Contact form label",
+          "default": "Have a question?"
+        },
+        {
+          "type": "text",
+          "id": "send_btn_text",
+          "label": "Submit button",
+          "default": "Send"
+        },
+        {
+          "type": "paragraph",
+          "content": "Name field"
+        },
+        {
+          "type": "text",
+          "id": "name_placeholder",
+          "label": "Name placeholder",
+          "default": "Name *"
+        },
+        {
+          "type": "paragraph",
+          "content": "Email field"
+        },
+        {
+          "type": "text",
+          "id": "email_placeholder",
+          "label": "Email placeholder",
+          "default": "Email *"
+        },
+        {
+          "type": "paragraph",
+          "content": "Phone Field"
+        },
+        {
+          "type": "text",
+          "id": "phone_placeholder",
+          "label": "Phone placeholder",
+          "default": "Phone *"
+        },
+        {
+        "type": "paragraph",
+          "content": "Link field"
+        },
+        {
+          "type": "text",
+          "id": "prod_url_placeholder",
+          "label": "Product link placeholder",
+          "default": "Reference link *"
+        },
+        {
+          "type": "paragraph",
+          "content": "Message body"
+        },
+        {
+          "type": "text",
+          "id": "body_placeholder",
+          "label": "Message body",
+          "default": "Write Message *"
+        }
+      ]
+    },
+    {
+      "type": "rating",
+      "name": "t:sections.main-product.blocks.rating.name",
+      "limit": 1,
+      "settings": [
+        {
+          "type": "paragraph",
+          "content": "t:sections.main-product.blocks.rating.settings.paragraph.content"
+        }
+      ]
     }
-
-    map[ticket_id] = {
-      ...(prev || {}),
-      ticket_id,
-      status,
-      order_id,
-      order_name: prev.order_name || d1?.order?.name || "",
-      created_at: prev.created_at || now,
-      updated_at: now,
-      ...(reply !== undefined ? { admin_reply: reply } : {})
-    };
-
-    const d2 = await adminGraphQL(
-      `
-      mutation Save($ownerId:ID!, $value:String!, $tid:String!, $st:String!){
-        metafieldsSet(metafields:[
-          { ownerId:$ownerId, namespace:"support", key:"tickets", type:"json", value:$value },
-          { ownerId:$ownerId, namespace:"support", key:"ticket_id", type:"single_line_text_field", value:$tid },
-          { ownerId:$ownerId, namespace:"support", key:"ticket_status", type:"single_line_text_field", value:$st }
-        ]) { userErrors { field message } }
-      }`,
-      { ownerId: orderGid, value: JSON.stringify(map), tid: ticket_id, st: status }
-    );
-
-    const err = d2?.metafieldsSet?.userErrors?.[0];
-    if (err) throw new Error(err.message);
-
-    res.json({ ok: true, ticket: map[ticket_id] });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// ----------------------------------------------------------------------
-app.listen(PORT, () =>
-  console.log(`[server] listening on :${PORT} mount=${PROXY_MOUNT} api=${API_VERSION}`)
-);
+  ]
+}
+{% endschema %}
